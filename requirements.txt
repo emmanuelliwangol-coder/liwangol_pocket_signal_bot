@@ -1,0 +1,6 @@
+python-telegram-bot==21.3
+yfinance==0.2.40
+pandas==2.2.2
+pandas-ta==0.3.14b0
+schedule==1.2.1
+requests==2.31.0
