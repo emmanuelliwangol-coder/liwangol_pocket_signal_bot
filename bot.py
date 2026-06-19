@@ -1,10 +1,10 @@
-"""
+\"\"\"
 ╔══════════════════════════════════════════════════╗
 ║   POCKET OPTION SIGNAL BOT — SMC EDITION        ║
 ║   Signals: FVG + Liquidity Sweep + MSS + EMA    ║
 ║   Commands: /start /stats /pairs /help /pause   ║
 ╚══════════════════════════════════════════════════╝
-"""
+\"\"\"
 
 import asyncio
 import json
@@ -275,12 +275,28 @@ def format_signal(sig):
     expiry = (now + timedelta(minutes=EXPIRY_MIN)).strftime("%H:%M UTC")
     lines  = "\n".join(f"    {t}" for t in sig["smc_tags"]) or "    (Base indicators)"
     stars  = "⭐" * sig["score"]
+    
+    # Calculate SL and 3 TP levels
+    entry = sig['price']
+    if sig['direction'] == "✅ CALL":
+        sl = round(entry * 0.9990, 5)
+        tp1 = round(entry * 1.0005, 5)
+        tp2 = round(entry * 1.0010, 5)
+        tp3 = round(entry * 1.0015, 5)
+    else:
+        sl = round(entry * 1.0010, 5)
+        tp1 = round(entry * 0.9995, 5)
+        tp2 = round(entry * 0.9990, 5)
+        tp3 = round(entry * 0.9985, 5)
+    
     return (
         f"🚨 *POCKET OPTION SIGNAL*\n"
         f"━━━━━━━━━━━━━━━━━━━━━━\n"
         f"💱 Pair: `{sig['symbol']}`\n"
         f"🎯 Direction: *{sig['direction']}*\n"
-        f"💰 Entry: `{sig['price']}`\n"
+        f"🎯 *Sniper Entry*: `{entry}`\n"
+        f"⛔ *Stop Loss (SL)*: `{sl}`\n"
+        f"✅ *TP1*: `{tp1}` | *TP2*: `{tp2}` | *TP3*: `{tp3}`\n"
         f"⏱ Expiry: *{EXPIRY_MIN} min* → `{expiry}`\n"
         f"📊 RSI: `{sig['rsi']}`\n"
         f"━━━━━━━━━━━━━━━━━━━━━━\n"
