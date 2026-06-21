@@ -550,11 +550,21 @@ def main():
     app.add_handler(CommandHandler("pause",   cmd_pause))
     app.add_handler(CommandHandler("resume",  cmd_resume))
 
-    app.job_queue.run_repeating(
-        callback=scan_and_send,
-        interval=SCAN_EVERY * 60,
-        first=15
-    )
+    import threading, time as _time
+    def _scheduler():
+        import asyncio
+        loop = asyncio.new_event_loop()
+        asyncio.set_event_loop(loop)
+        _time.sleep(15)
+        while True:
+            try:
+                loop.run_until_complete(scan_and_send())
+            except Exception as e:
+                log.error(f"Scheduler error: {e}")
+            _time.sleep(SCAN_EVERY * 60)
+
+    t = threading.Thread(target=_scheduler, daemon=True)
+    t.start()
 
     log.info(f"🤖 SMC PRO Bot online! Scanning every {SCAN_EVERY} min.")
     app.run_polling(drop_pending_updates=True)
