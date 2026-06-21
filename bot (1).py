@@ -27,8 +27,8 @@ from telegram.ext import Application, CommandHandler, ContextTypes
 BOT_TOKEN  = os.getenv("BOT_TOKEN", "8628123105:AAGRCl-k3O-0xXfI7fHgWoonvaN1Q8F_pRU")
 CHAT_ID    = os.getenv("CHAT_ID",   "8494805451")
 EXPIRY_MIN = 3        # 3 minute expiry (your preference)
-SCAN_EVERY = 3        # scan every 3 minutes
-MIN_SCORE  = 4        # minimum confluence score (max 7)
+SCAN_EVERY = 2        # scan every 3 minutes
+MIN_SCORE  = 2        # minimum confluence score (max 7)
 STATS_FILE = "stats.json"
 
 PAIRS = {
@@ -321,9 +321,6 @@ class SMCProAnalyzer:
             return None
 
         htf = self.get_htf_bias(ticker)
-        if htf is not None and htf != bias:
-            log.info(f"{symbol} HTF conflict ({htf} vs {bias}) — skip")
-            return None
 
         fvg_b,  fvg_r  = self.detect_fvg(df)
         liq_b,  liq_r  = self.detect_liquidity_sweep(df)
