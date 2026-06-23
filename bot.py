@@ -1,8 +1,9 @@
 """
 ╔══════════════════════════════════════════════════╗
 ║   POCKET OPTION SIGNAL BOT — SMC PRO EDITION   ║
-║   Data: Twelve Data API (replaces yfinance)     ║
-║   Expiry: 3 min | Sessions: London + NY         ║
+║   Data: Twelve Data API (replaces yfinance)    ║
+║   Expiry: 3 min | Sessions: London + NY 
+                  python-telegram-bot[job-queue] ║
 ╚══════════════════════════════════════════════════╝
 """
 
@@ -665,25 +666,18 @@ async def error_handler(update: object, context: ContextTypes.DEFAULT_TYPE):
 # ──────────────────────────────────────────────────
 # MAIN — webhook mode (no polling, no 409 Conflict)
 # ──────────────────────────────────────────────────
+from telegram.ext import ApplicationBuilder # Ensure this import is added at the top
+
 def main():
     global telegram_bot
 
     if not WEBHOOK_URL:
-        log.critical(
-            "WEBHOOK_URL env var is not set!\n"
-            "Go to Railway → your service → Variables and add:\n"
-            "  WEBHOOK_URL = https://<your-service>.up.railway.app"
-        )
+        log.critical("WEBHOOK_URL env var is not set!")
         raise SystemExit(1)
 
-    app = (
-        Application.builder()
-        .token(BOT_TOKEN)
-        .connect_timeout(30)
-        .read_timeout(30)
-        .write_timeout(30)
-        .build()
-    )
+    # FIX: Use ApplicationBuilder to properly initialize the JobQueue
+    app = ApplicationBuilder().token(BOT_TOKEN).build()
+    
     telegram_bot = app.bot
 
     app.add_handler(CommandHandler("start",   cmd_start))
@@ -699,19 +693,14 @@ def main():
 
     app.add_error_handler(error_handler)
 
-    # Background scanner job
+    # Background scanner job (now safe because app.job_queue is initialized)
     app.job_queue.run_repeating(scan_and_send, interval=SCAN_EVERY * 60, first=30)
 
     webhook_path = f"/webhook/{BOT_TOKEN}"
     full_webhook_url = f"{WEBHOOK_URL.rstrip('/')}{webhook_path}"
 
     log.info(f"Starting webhook on port {WEBHOOK_PORT}")
-    log.info(f"Webhook URL: {full_webhook_url}")
-
-    # run_webhook handles everything:
-    # - registers the webhook with Telegram
-    # - starts a lightweight HTTP server on WEBHOOK_PORT
-    # - no polling, no conflict possible
+    
     app.run_webhook(
         listen="0.0.0.0",
         port=WEBHOOK_PORT,
@@ -719,7 +708,3 @@ def main():
         webhook_url=full_webhook_url,
         drop_pending_updates=True,
     )
-
-
-if __name__ == "__main__":
-    main()
