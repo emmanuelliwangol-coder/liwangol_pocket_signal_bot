@@ -22,9 +22,9 @@ from telegram.ext import Application, CommandHandler, ContextTypes
 # ──────────────────────────────────────────────────
 # CONFIG
 # ──────────────────────────────────────────────────
-BOT_TOKEN    = os.getenv("BOT_TOKEN", "8628123105:AAGRCl-k3O-0xXfI7fHgWoonvaN1Q8F_pRU")
-CHAT_ID      = os.getenv("CHAT_ID",   "8494805451")
-TD_API_KEY   = os.getenv("TD_API_KEY","310a0ed4468144a09c38b2687369f314")
+BOT_TOKEN    = os.getenv("BOT_TOKEN", "")
+CHAT_ID      = os.getenv("CHAT_ID",   "")
+TD_API_KEY   = os.getenv("TD_API_KEY", "")
 EXPIRY_MIN      = 3
 SCAN_EVERY      = 3
 MIN_SCORE       = 2
