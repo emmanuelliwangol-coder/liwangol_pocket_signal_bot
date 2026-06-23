@@ -28,7 +28,8 @@ TD_API_KEY   = os.getenv("TD_API_KEY", "")
 EXPIRY_MIN      = 3
 SCAN_EVERY      = 3
 MIN_SCORE       = 2
-MIN_CONFIDENCE  = 70        # Only send signals with confidence ≥ this %
+MIN_CONFIDENCE  = 65        # Only send signals with confidence ≥ this %
+PRE_SIGNAL_MIN  = 45        # Send pre-signal alert at this confidence level
 MAX_SCORE       = 7         # Total possible confluence points
 STATS_FILE      = "stats.json"
 
@@ -359,35 +360,43 @@ class SMCProAnalyzer:
 
         if score < MIN_SCORE:
             log.info(f"{symbol} score {score} < {MIN_SCORE} — skip")
-            return None
+            return None, None
 
         # ── Confidence score ──────────────────────────────────────
-        # Base: confluence ratio (score/MAX_SCORE)
         confidence = round((score / MAX_SCORE) * 100)
 
-        # Bonus +5 if HTF bias aligns with direction (checked below)
         htf = self.get_htf_bias(td_symbol)
         if htf and htf == bias:
             confidence = min(confidence + 5, 100)
 
-        # Bonus +5 if both RSI AND BB confluences are active
         rsi_hit = meta["bull_rsi"] if bias == "CALL" else meta["bear_rsi"]
         bb_hit  = meta["bull_bb"]  if bias == "CALL" else meta["bear_bb"]
         if rsi_hit and bb_hit:
             confidence = min(confidence + 5, 100)
 
-        if confidence < MIN_CONFIDENCE:
-            log.info(f"{symbol} confidence {confidence}% < {MIN_CONFIDENCE}% — skip")
-            return None
+        # All detected tags (active = confirmed, pending = missing)
+        all_tags = tags
+        pending  = [tags[i] for i,h in enumerate(hits) if not h]
 
         strength = ("🔥 VERY STRONG" if score>=6 else
                     "💪 STRONG"      if score>=4 else "✅ GOOD")
 
-        return {"symbol":symbol,"direction":emoji,"raw_dir":bias,
-                "price":round(meta["price"],5),"rsi":meta["rsi"],
-                "score":score,"strength":strength,"smc_tags":active,
-                "confidence":confidence,
-                "session":session_name(),"htf_bias":htf or "Neutral"}
+        result = {"symbol":symbol,"direction":emoji,"raw_dir":bias,
+                  "price":round(meta["price"],5),"rsi":meta["rsi"],
+                  "score":score,"strength":strength,"smc_tags":active,
+                  "pending_tags":pending,
+                  "confidence":confidence,
+                  "session":session_name(),"htf_bias":htf or "Neutral"}
+
+        if confidence >= MIN_CONFIDENCE:
+            log.info(f"{symbol} confidence {confidence}% — SIGNAL")
+            return result, "signal"
+        elif confidence >= PRE_SIGNAL_MIN:
+            log.info(f"{symbol} confidence {confidence}% — PRE-SIGNAL")
+            return result, "presignal"
+        else:
+            log.info(f"{symbol} confidence {confidence}% < {PRE_SIGNAL_MIN}% — skip")
+            return None, None
 
 # ──────────────────────────────────────────────────
 # SIGNAL FORMATTER
@@ -442,18 +451,48 @@ def format_signal(sig):
         f"📝 _Reply /win or /loss after trade_"
     )
 
+def format_presignal(sig):
+    now     = datetime.utcnow()
+    active  = "\n".join(f"    ✅ {t}" for t in sig["smc_tags"])
+    pending = "\n".join(f"    ⏳ {t}" for t in sig["pending_tags"])
+    conf    = sig["confidence"]
+    needed  = MIN_CONFIDENCE - conf
+    filled  = round(conf / 10)
+    bar     = "🟡" * filled + "⬜" * (10 - filled)
+    return (
+        f"👀 *SETUP FORMING — {sig['symbol']}*\n"
+        f"━━━━━━━━━━━━━━━━━━━━━━\n"
+        f"⚠️ _Market is building confluence..._\n"
+        f"🎯 Potential: *{sig['direction']}*\n"
+        f"📍 Session: {sig['session']}\n"
+        f"📈 HTF Bias: `{sig['htf_bias']}`\n"
+        f"━━━━━━━━━━━━━━━━━━━━━━\n"
+        f"✅ *Confirmed so far:*\n{active}\n"
+        f"━━━━━━━━━━━━━━━━━━━━━━\n"
+        f"⏳ *Still needs:*\n{pending}\n"
+        f"━━━━━━━━━━━━━━━━━━━━━━\n"
+        f"📊 *Setup Confidence*: `{conf}%` _(+{needed}% more needed for entry signal)_\n"
+        f"{bar} `{conf}%`\n"
+        f"━━━━━━━━━━━━━━━━━━━━━━\n"
+        f"👁 *Watch `{sig['symbol']}` closely — signal may fire soon!*\n"
+        f"🕐 `{now.strftime('%H:%M:%S UTC')}`"
+    )
+
+
 # ──────────────────────────────────────────────────
 # BOT STATE
 # ──────────────────────────────────────────────────
-bot_paused   = False
-stats        = StatsManager()
-analyzer     = SMCProAnalyzer()
-telegram_bot = None
+bot_paused      = False
+stats           = StatsManager()
+analyzer        = SMCProAnalyzer()
+telegram_bot    = None
+presignal_sent  = {}   # symbol -> last presignal confidence (avoid spam)
 
 # ──────────────────────────────────────────────────
 # SCANNER
 # ──────────────────────────────────────────────────
 async def scan_and_send(context=None):
+    global presignal_sent
     if bot_paused or telegram_bot is None:
         return
     if not is_active_session():
@@ -463,8 +502,8 @@ async def scan_and_send(context=None):
     log.info(f"🔍 Scanning | {session_name()}")
     sent = 0
     for symbol, td_symbol in PAIRS.items():
-        sig = analyzer.analyze(symbol, td_symbol)
-        if sig:
+        sig, sig_type = analyzer.analyze(symbol, td_symbol)
+        if sig and sig_type == "signal":
             try:
                 await telegram_bot.send_message(
                     chat_id=CHAT_ID,
@@ -472,11 +511,34 @@ async def scan_and_send(context=None):
                     parse_mode="Markdown"
                 )
                 stats.add_signal(sig["symbol"],sig["raw_dir"],sig["price"],sig["score"])
+                presignal_sent.pop(symbol, None)   # clear presignal tracker
                 sent += 1
-                log.info(f"✅ {symbol} {sig['direction']} score={sig['score']}")
+                log.info(f"Signal sent: {symbol} {sig['direction']} score={sig['score']}")
                 await asyncio.sleep(2)
             except Exception as e:
                 log.error(f"Send error {symbol}: {e}")
+
+        elif sig and sig_type == "presignal":
+            # Only send presignal if confidence jumped since last alert
+            last_conf = presignal_sent.get(symbol, 0)
+            if sig["confidence"] >= last_conf + 5:   # only alert on 5%+ jump
+                try:
+                    await telegram_bot.send_message(
+                        chat_id=CHAT_ID,
+                        text=format_presignal(sig),
+                        parse_mode="Markdown"
+                    )
+                    presignal_sent[symbol] = sig["confidence"]
+                    sent += 1
+                    log.info(f"Pre-signal sent: {symbol} conf={sig['confidence']}%")
+                    await asyncio.sleep(2)
+                except Exception as e:
+                    log.error(f"Pre-signal send error {symbol}: {e}")
+            else:
+                log.info(f"Pre-signal suppressed: {symbol} conf={sig['confidence']}% (last={last_conf}%)")
+        else:
+            presignal_sent.pop(symbol, None)   # reset if setup disappeared
+
     if sent == 0:
         log.info("No qualifying signals.")
 
