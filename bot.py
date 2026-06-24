@@ -319,20 +319,20 @@ class SMCProAnalyzer:
 
     def analyze(self, symbol, td_symbol):
         if not is_active_session():
-            return None
+            return None, None
 
         df = fetch_candles(td_symbol, interval="1min", outputsize=100)
         if df is None or len(df) < 60:
-            return None
+            return None, None
 
         try:
             bias, meta = self.get_indicators(df)
         except Exception as e:
             log.warning(f"Indicator error {symbol}: {e}")
-            return None
+            return None, None
 
         if bias is None:
-            return None
+            return None, None
 
         fvg_b,  fvg_r  = self.detect_fvg(df)
         liq_b,  liq_r  = self.detect_liquidity_sweep(df)
