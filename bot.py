@@ -505,6 +505,7 @@ async def scan_and_send(context=None):
     log.info(f"🔍 Scanning | {session_name()}")
     sent = 0
     for symbol, td_symbol in PAIRS.items():
+        await asyncio.sleep(8)   # 8s gap between pairs = stays under API rate limit
         sig, sig_type = analyzer.analyze(symbol, td_symbol)
         if sig and sig_type == "signal":
             try:
