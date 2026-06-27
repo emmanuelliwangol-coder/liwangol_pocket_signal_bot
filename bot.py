@@ -522,10 +522,8 @@ async def scan_and_send(context=None):
     global presignal_sent
     if bot_paused or telegram_bot is None:
         return
-    if not is_active_session():
-        log.info("Outside session — skip")
-        return
-
+    # Each pair decides its own session via analyze(symbol)
+    # BTC scans 24/7, forex/gold only during London/NY on weekdays
     log.info(f"🔍 Scanning | {session_name()}")
     sent = 0
     for symbol, td_symbol in PAIRS.items():
