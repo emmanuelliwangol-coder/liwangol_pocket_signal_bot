@@ -229,8 +229,11 @@ class StatsManager:
 # ──────────────────────────────────────────────────
 class SMCProAnalyzer:
 
-    def get_htf_bias(self, symbol):
-        df = fetch_htf_candles(symbol)
+    def get_htf_bias(self, symbol, orig_symbol=""):
+        if orig_symbol == "BTCUSD":
+            df = fetch_binance_htf("BTCUSDT")
+        else:
+            df = fetch_htf_candles(symbol)
         if df is None or len(df) < 60:
             return None
         try:
@@ -368,7 +371,7 @@ class SMCProAnalyzer:
         # ── Confidence score ──────────────────────────────────────
         confidence = round((score / MAX_SCORE) * 100)
 
-        htf = self.get_htf_bias(td_symbol)
+        htf = self.get_htf_bias(td_symbol, symbol)
         if htf and htf == bias:
             confidence = min(confidence + 5, 100)
 
