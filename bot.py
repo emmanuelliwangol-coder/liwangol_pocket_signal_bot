@@ -135,6 +135,31 @@ def fetch_htf_candles(symbol: str) -> pd.DataFrame | None:
     return fetch_candles(symbol, interval="5min", outputsize=200)
 
 # ──────────────────────────────────────────────────
+# BINANCE FETCHER (for BTCUSD — free, no API key)
+# ──────────────────────────────────────────────────
+def fetch_binance_candles(symbol: str = "BTCUSDT", interval: str = "1m", limit: int = 100):
+    url = "https://api.binance.com/api/v3/klines"
+    try:
+        r = requests.get(url, params={"symbol": symbol, "interval": interval, "limit": limit}, timeout=10)
+        data = r.json()
+        if not isinstance(data, list) or len(data) == 0:
+            log.warning(f"Binance: no data for {symbol}")
+            return None
+        df = pd.DataFrame(data, columns=[
+            "OpenTime","Open","High","Low","Close","Volume",
+            "CloseTime","QAV","NT","TBBAV","TBQAV","Ignore"
+        ])
+        for col in ["Open","High","Low","Close"]:
+            df[col] = pd.to_numeric(df[col])
+        return df.reset_index(drop=True)
+    except Exception as e:
+        log.warning(f"Binance fetch error {symbol}: {e}")
+        return None
+
+def fetch_binance_htf(symbol: str = "BTCUSDT"):
+    return fetch_binance_candles(symbol, interval="5m", limit=200)
+
+# ──────────────────────────────────────────────────
 # SL / TP CALCULATOR
 # ──────────────────────────────────────────────────
 def calculate_sl_tp(entry: float, direction: str, symbol: str):
