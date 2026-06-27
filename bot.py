@@ -68,11 +68,32 @@ log = logging.getLogger(__name__)
 # ──────────────────────────────────────────────────
 # SESSION HELPERS
 # ──────────────────────────────────────────────────
-def is_active_session():
+def is_weekend():
+    """Returns True on Saturday and Sunday (UTC)."""
+    return datetime.utcnow().weekday() >= 5  # 5=Saturday, 6=Sunday
+
+def is_active_session(symbol: str = ""):
+    """
+    Forex/Gold: only active Mon-Fri during London/NY sessions.
+    BTC: active 24/7 including weekends.
+    """
+    if symbol == "BTCUSD":
+        return True   # Crypto never closes
+    if is_weekend():
+        return False  # Forex/Gold closed on weekends
     hour = datetime.utcnow().hour
     return any(s <= hour < e for s, e in SESSIONS)
 
-def session_name():
+def session_name(symbol: str = ""):
+    if symbol == "BTCUSD":
+        if is_weekend():
+            return "₿ Crypto Weekend Session"
+        hour = datetime.utcnow().hour
+        if 8 <= hour < 12:  return "₿ Crypto | 🇬🇧 London Hours"
+        if 13 <= hour < 17: return "₿ Crypto | 🇺🇸 NY Hours"
+        return "₿ Crypto 24/7"
+    if is_weekend():
+        return "📴 Weekend — Forex Closed"
     hour = datetime.utcnow().hour
     if 8 <= hour < 12:  return "🇬🇧 London Session"
     if 13 <= hour < 17: return "🇺🇸 New York Session"
@@ -158,7 +179,7 @@ class StatsManager:
         self.data["pending"].append({
             "symbol": symbol, "direction": direction,
             "entry_price": price, "score": score,
-            "session": session_name(),
+            "session": session_name(symbol),
             "entry_time": datetime.utcnow().isoformat(),
             "expiry_time": (datetime.utcnow()+timedelta(minutes=EXPIRY_MIN)).isoformat(),
         })
@@ -324,7 +345,7 @@ class SMCProAnalyzer:
         }
 
     def analyze(self, symbol, td_symbol):
-        if not is_active_session():
+        if not is_active_session(symbol):
             return None, None
 
         df = fetch_candles(td_symbol, interval="1min", outputsize=100)
@@ -392,7 +413,7 @@ class SMCProAnalyzer:
                   "score":score,"strength":strength,"smc_tags":active,
                   "pending_tags":pending,
                   "confidence":confidence,
-                  "session":session_name(),"htf_bias":htf or "Neutral"}
+                  "session":session_name(symbol),"htf_bias":htf or "Neutral"}
 
         if confidence >= MIN_CONFIDENCE:
             log.info(f"{symbol} confidence {confidence}% — SIGNAL")
