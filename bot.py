@@ -26,9 +26,9 @@ BOT_TOKEN    = os.getenv("BOT_TOKEN", "")
 CHAT_ID      = os.getenv("CHAT_ID",   "")
 TD_API_KEY   = os.getenv("TD_API_KEY", "")
 EXPIRY_MIN      = 3
-SCAN_EVERY      = 10
+SCAN_EVERY      = 5
 MIN_SCORE       = 2
-MIN_CONFIDENCE  = 60        # Only send signals with confidence ≥ this %
+MIN_CONFIDENCE  = 55        # Only send signals with confidence >= this %
 PRE_SIGNAL_MIN  = 45        # Send pre-signal alert at this confidence level
 MAX_SCORE       = 7         # Total possible confluence points
 STATS_FILE      = "stats.json"
@@ -45,9 +45,6 @@ PAIRS = {
     "GBPUSD": "GBP/USD",
     "USDJPY": "USD/JPY",
     "BTCUSD": "BTC/USD",
-    "AUDUSD": "AUD/USD",
-    "USDCAD": "USD/CAD",
-    "NZDUSD": "NZD/USD",
 }
 
 SESSIONS = [
@@ -605,7 +602,7 @@ async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         f"• Min Confidence: `{MIN_CONFIDENCE}%` _(only HIGH confidence signals sent)_\n"
         f"• Sessions: London + New York\n"
         f"• Data: Twelve Data API ✅\n"
-        f"• Pairs: XAUUSD, EURUSD, GBPUSD, BTCUSD, USDJPY, AUDUSD, USDCAD, NZDUSD\n\n"
+        f"• Pairs: XAUUSD, EURUSD, GBPUSD, USDJPY, BTCUSD\n\n"
         f"🧠 *Active Filters*\n"
         f"• HTF Trend Bias\n• Fair Value Gap\n"
         f"• Liquidity Sweep\n• MSS\n"
