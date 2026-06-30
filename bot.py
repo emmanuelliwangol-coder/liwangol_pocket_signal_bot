@@ -129,7 +129,7 @@ def fetch_candles(symbol: str, interval="1min", outputsize=100) -> pd.DataFrame 
         return None
 
 def fetch_htf_candles(symbol: str) -> pd.DataFrame | None:
-    return fetch_candles(symbol, interval="5min", outputsize=200)
+    return fetch_candles(symbol, interval="1h", outputsize=200)
 
 # ──────────────────────────────────────────────────
 # BINANCE FETCHER (for BTCUSD — free, no API key)
@@ -154,18 +154,35 @@ def fetch_binance_candles(symbol: str = "BTCUSDT", interval: str = "1m", limit: 
         return None
 
 def fetch_binance_htf(symbol: str = "BTCUSDT"):
-    return fetch_binance_candles(symbol, interval="5m", limit=200)
+    return fetch_binance_candles(symbol, interval="1h", limit=200)
 
 # ──────────────────────────────────────────────────
 # SL / TP CALCULATOR
 # ──────────────────────────────────────────────────
 def calculate_sl_tp(entry: float, direction: str, symbol: str):
+    """
+    MT5-optimized SL/TP levels with proper room to breathe.
+    Risk:Reward = 1:1.5 / 1:2 / 1:3 across TP1/TP2/TP3
+    """
     if symbol == "XAUUSD":
-        sl_pct = 0.0015; tp_pcts = [0.0008, 0.0015, 0.0025]
+        # Gold: SL ~$2.00 (20 pips), TPs at 1.5R / 2R / 3R
+        sl_pct  = 0.0012   # ~$2.00 SL on gold
+        tp_pcts = [0.0018, 0.0024, 0.0036]   # 1.5R / 2R / 3R
+
     elif symbol == "BTCUSD":
-        sl_pct = 0.0030; tp_pcts = [0.0015, 0.0030, 0.0050]
+        # BTC: SL ~$250-300, TPs proportional
+        sl_pct  = 0.0040   # ~$250 SL on BTC
+        tp_pcts = [0.0060, 0.0080, 0.0120]   # 1.5R / 2R / 3R
+
+    elif symbol in ("USDJPY",):
+        # JPY pairs: SL 20 pips (pip = 0.01)
+        sl_pct  = 0.0020
+        tp_pcts = [0.0030, 0.0040, 0.0060]
+
     else:
-        sl_pct = 0.0010; tp_pcts = [0.0005, 0.0010, 0.0015]
+        # Major forex (EURUSD, GBPUSD, AUDUSD etc): SL 20-25 pips
+        sl_pct  = 0.0020   # ~20-25 pips
+        tp_pcts = [0.0030, 0.0040, 0.0060]   # 1.5R / 2R / 3R
 
     if direction == "CALL":
         sl  = round(entry * (1 - sl_pct), 5)
@@ -370,7 +387,7 @@ class SMCProAnalyzer:
         if not is_active_session(symbol):
             return None, None
 
-        df = fetch_candles(td_symbol, interval="1min", outputsize=100)
+        df = fetch_candles(td_symbol, interval="15min", outputsize=100)
         if df is None or len(df) < 60:
             return None, None
 
