@@ -422,7 +422,7 @@ class SMCProAnalyzer:
             "bull_bb":  lc<=bbl,   "bear_bb":  lc>=bbh,
         }
 
-    def analyze(self, symbol, td_symbol, df=None):
+    def analyze(self, symbol, td_symbol, df=None, htf_bias="__unset__"):
         if not is_active_session(symbol):
             return None, None
 
@@ -470,7 +470,11 @@ class SMCProAnalyzer:
 
         confidence = round((score / MAX_SCORE) * 100)
 
-        htf = self.get_htf_bias(td_symbol, symbol)
+        # Use the pre-computed HTF bias if the caller passed one (avoids a
+        # duplicate API call — scan_and_send fetches this once per symbol
+        # per cycle and shares it across all 5 strategies). Only falls
+        # back to fetching it here if analyze() is called standalone.
+        htf = htf_bias if htf_bias != "__unset__" else self.get_htf_bias(td_symbol, symbol)
         if htf and htf == bias:
             confidence = min(confidence + 5, 100)
 
@@ -606,20 +610,30 @@ async def scan_and_send(context=None):
     for symbol, td_symbol in PAIRS.items():
         await asyncio.sleep(15)
 
-        # Fetch once, reuse for both strategies
+        # Check the session BEFORE spending any API calls. BTCUSD is
+        # always "open" (crypto trades 24/7). Forex/gold pairs skip
+        # entirely when outside London/NY hours or on weekends — this
+        # is what actually saves API credits, not just skipping the
+        # strategies after the data was already fetched.
+        market_open = is_active_session(symbol)
+        if not market_open:
+            log.info(f"[MULTI-STRAT] {symbol} market closed/off-session — skipping fetch entirely")
+            presignal_sent.pop(symbol, None)
+            continue
+
+        # Fetch once, reuse across all 5 strategies
         if symbol == "BTCUSD":
             df = fetch_binance_candles("BTCUSDT", interval="15m", limit=100)
         else:
             df = fetch_candles(td_symbol, interval="15min", outputsize=100)
 
-        # Gate for the 4 non-SMC strategies. SMC already checks this
-        # internally via analyzer.analyze(). BTCUSD is always "open"
-        # (crypto trades 24/7) — everything else only runs during the
-        # configured London/NY windows, on weekdays.
-        market_open = is_active_session(symbol)
+        # Fetch HTF bias ONCE per symbol per scan cycle and share it —
+        # previously this was fetched twice (once inside SMC's analyze(),
+        # once again for Pullback/MeanReversion), doubling API usage.
+        htf_bias = analyzer.get_htf_bias(td_symbol, symbol)
 
         # ── SMC strategy ──
-        sig, sig_type = analyzer.analyze(symbol, td_symbol, df=df)
+        sig, sig_type = analyzer.analyze(symbol, td_symbol, df=df, htf_bias=htf_bias)
         if sig and sig_type == "signal":
             try:
                 trade_id = stats.add_signal(sig["symbol"], sig["raw_dir"], sig["price"], sig["score"], strategy="SMC")
@@ -651,70 +665,66 @@ async def scan_and_send(context=None):
         else:
             presignal_sent.pop(symbol, None)
 
-        if not market_open:
-            log.info(f"[MULTI-STRAT] {symbol} market closed/off-session — skipping BREAKOUT/PULLBACK/STRUCTURE/MEANREV")
-        else:
-            # ── London Breakout strategy ──
-            try:
-                bsig = breakout_analyzer.analyze(symbol, df)
-                if bsig:
-                    trade_id = stats.add_signal(bsig["symbol"], bsig["raw_dir"], bsig["price"], bsig.get("confidence", 0), strategy="BREAKOUT")
-                    text = format_breakout_signal(bsig) + f"\n🆔 *Trade ID*: `{trade_id}`"
-                    await telegram_bot.send_message(
-                        chat_id=CHAT_ID, text=text, parse_mode="Markdown"
-                    )
-                    sent += 1
-                    log.info(f"[BREAKOUT] Signal sent: {symbol} {bsig['direction']} id={trade_id}")
-                    await asyncio.sleep(2)
-            except Exception as e:
-                log.error(f"[BREAKOUT] Error {symbol}: {e}")
 
-            # ── Trend Pullback strategy ──
-            htf_bias = None
-            try:
-                htf_bias = analyzer.get_htf_bias(td_symbol, symbol)
-                psig = pullback_analyzer.analyze(symbol, df, htf_bias)
-                if psig:
-                    trade_id = stats.add_signal(psig["symbol"], psig["raw_dir"], psig["price"], psig.get("confidence", 0), strategy="PULLBACK")
-                    text = format_pullback_signal(psig) + f"\n🆔 *Trade ID*: `{trade_id}`"
-                    await telegram_bot.send_message(
-                        chat_id=CHAT_ID, text=text, parse_mode="Markdown"
-                    )
-                    sent += 1
-                    log.info(f"[PULLBACK] Signal sent: {symbol} {psig['direction']} id={trade_id}")
-                    await asyncio.sleep(2)
-            except Exception as e:
-                log.error(f"[PULLBACK] Error {symbol}: {e}")
+        # ── London Breakout strategy ──
+        try:
+            bsig = breakout_analyzer.analyze(symbol, df)
+            if bsig:
+                trade_id = stats.add_signal(bsig["symbol"], bsig["raw_dir"], bsig["price"], bsig.get("confidence", 0), strategy="BREAKOUT")
+                text = format_breakout_signal(bsig) + f"\n🆔 *Trade ID*: `{trade_id}`"
+                await telegram_bot.send_message(
+                    chat_id=CHAT_ID, text=text, parse_mode="Markdown"
+                )
+                sent += 1
+                log.info(f"[BREAKOUT] Signal sent: {symbol} {bsig['direction']} id={trade_id}")
+                await asyncio.sleep(2)
+        except Exception as e:
+            log.error(f"[BREAKOUT] Error {symbol}: {e}")
 
-            # ── Price Action + Structure strategy ──
-            try:
-                ssig = structure_analyzer.analyze(symbol, df)
-                if ssig:
-                    trade_id = stats.add_signal(ssig["symbol"], ssig["raw_dir"], ssig["price"], ssig.get("confidence", 0), strategy="STRUCTURE")
-                    text = format_structure_signal(ssig) + f"\n🆔 *Trade ID*: `{trade_id}`"
-                    await telegram_bot.send_message(
-                        chat_id=CHAT_ID, text=text, parse_mode="Markdown"
-                    )
-                    sent += 1
-                    log.info(f"[STRUCTURE] Signal sent: {symbol} {ssig['direction']} id={trade_id}")
-                    await asyncio.sleep(2)
-            except Exception as e:
-                log.error(f"[STRUCTURE] Error {symbol}: {e}")
+        # ── Trend Pullback strategy (reuses htf_bias fetched above — no extra API call) ──
+        try:
+            psig = pullback_analyzer.analyze(symbol, df, htf_bias)
+            if psig:
+                trade_id = stats.add_signal(psig["symbol"], psig["raw_dir"], psig["price"], psig.get("confidence", 0), strategy="PULLBACK")
+                text = format_pullback_signal(psig) + f"\n🆔 *Trade ID*: `{trade_id}`"
+                await telegram_bot.send_message(
+                    chat_id=CHAT_ID, text=text, parse_mode="Markdown"
+                )
+                sent += 1
+                log.info(f"[PULLBACK] Signal sent: {symbol} {psig['direction']} id={trade_id}")
+                await asyncio.sleep(2)
+        except Exception as e:
+            log.error(f"[PULLBACK] Error {symbol}: {e}")
 
-            # ── Mean Reversion strategy (fires only when market is ranging) ──
-            try:
-                msig = meanrev_analyzer.analyze(symbol, df, htf_bias)
-                if msig:
-                    trade_id = stats.add_signal(msig["symbol"], msig["raw_dir"], msig["price"], msig.get("confidence", 0), strategy="MEANREV")
-                    text = format_meanrev_signal(msig) + f"\n🆔 *Trade ID*: `{trade_id}`"
-                    await telegram_bot.send_message(
-                        chat_id=CHAT_ID, text=text, parse_mode="Markdown"
-                    )
-                    sent += 1
-                    log.info(f"[MEANREV] Signal sent: {symbol} {msig['direction']} id={trade_id}")
-                    await asyncio.sleep(2)
-            except Exception as e:
-                log.error(f"[MEANREV] Error {symbol}: {e}")
+        # ── Price Action + Structure strategy ──
+        try:
+            ssig = structure_analyzer.analyze(symbol, df)
+            if ssig:
+                trade_id = stats.add_signal(ssig["symbol"], ssig["raw_dir"], ssig["price"], ssig.get("confidence", 0), strategy="STRUCTURE")
+                text = format_structure_signal(ssig) + f"\n🆔 *Trade ID*: `{trade_id}`"
+                await telegram_bot.send_message(
+                    chat_id=CHAT_ID, text=text, parse_mode="Markdown"
+                )
+                sent += 1
+                log.info(f"[STRUCTURE] Signal sent: {symbol} {ssig['direction']} id={trade_id}")
+                await asyncio.sleep(2)
+        except Exception as e:
+            log.error(f"[STRUCTURE] Error {symbol}: {e}")
+
+        # ── Mean Reversion strategy (fires only when market is ranging, reuses same htf_bias) ──
+        try:
+            msig = meanrev_analyzer.analyze(symbol, df, htf_bias)
+            if msig:
+                trade_id = stats.add_signal(msig["symbol"], msig["raw_dir"], msig["price"], msig.get("confidence", 0), strategy="MEANREV")
+                text = format_meanrev_signal(msig) + f"\n🆔 *Trade ID*: `{trade_id}`"
+                await telegram_bot.send_message(
+                    chat_id=CHAT_ID, text=text, parse_mode="Markdown"
+                )
+                sent += 1
+                log.info(f"[MEANREV] Signal sent: {symbol} {msig['direction']} id={trade_id}")
+                await asyncio.sleep(2)
+        except Exception as e:
+            log.error(f"[MEANREV] Error {symbol}: {e}")
 
     if sent == 0:
         log.info("No qualifying signals.")
