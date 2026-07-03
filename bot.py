@@ -23,6 +23,10 @@ from london_breakout import (
     LondonBreakoutAnalyzer,
     format_breakout_signal,
 )
+from trend_pullback import (
+    TrendPullbackAnalyzer,
+    format_pullback_signal,
+)
 
 # ──────────────────────────────────────────────────
 # CONFIG
@@ -572,6 +576,7 @@ bot_paused        = False
 stats             = StatsManager()
 analyzer          = SMCProAnalyzer()
 breakout_analyzer = LondonBreakoutAnalyzer()
+pullback_analyzer = TrendPullbackAnalyzer()
 telegram_bot      = None
 presignal_sent    = {}
 
@@ -639,6 +644,21 @@ async def scan_and_send(context=None):
         except Exception as e:
             log.error(f"[BREAKOUT] Error {symbol}: {e}")
 
+        # ── Trend Pullback strategy ──
+        try:
+            htf_bias = analyzer.get_htf_bias(td_symbol, symbol)
+            psig = pullback_analyzer.analyze(symbol, df, htf_bias)
+            if psig:
+                await telegram_bot.send_message(
+                    chat_id=CHAT_ID, text=format_pullback_signal(psig), parse_mode="Markdown"
+                )
+                stats.add_signal(psig["symbol"], psig["raw_dir"], psig["price"], 0, strategy="PULLBACK")
+                sent += 1
+                log.info(f"[PULLBACK] Signal sent: {symbol} {psig['direction']}")
+                await asyncio.sleep(2)
+        except Exception as e:
+            log.error(f"[PULLBACK] Error {symbol}: {e}")
+
     if sent == 0:
         log.info("No qualifying signals.")
 
@@ -650,7 +670,8 @@ async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "👋 *Multi-Strategy Signal Bot*\n\n"
         f"⚙️ *Active Strategies*\n"
         f"• 🧠 SMC PRO (15M entries, 1H HTF bias)\n"
-        f"• 🇬🇧 London Breakout (session range breakout)\n\n"
+        f"• 🇬🇧 London Breakout (session range breakout)\n"
+        f"• 📈 Trend Pullback (EMA21 pullback + rejection)\n\n"
         f"⚙️ *Settings*\n"
         f"• Min SMC Score: `{MIN_SCORE}/7`\n"
         f"• Min Confidence: `{MIN_CONFIDENCE}%`\n"
@@ -716,7 +737,7 @@ def _pop_pending(context_args: list) -> dict | None:
         return pending.pop()
 
     args = [a.upper() for a in context_args]
-    strategies = {"SMC", "BREAKOUT"}
+    strategies = {"SMC", "BREAKOUT", "PULLBACK"}
     symbol_arg   = next((a for a in args if a not in strategies), None)
     strategy_arg = next((a for a in args if a in strategies), None)
 
