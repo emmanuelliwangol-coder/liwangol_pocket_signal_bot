@@ -649,7 +649,7 @@ async def scan_and_send(context=None):
         try:
             bsig = breakout_analyzer.analyze(symbol, df)
             if bsig:
-                trade_id = stats.add_signal(bsig["symbol"], bsig["raw_dir"], bsig["price"], 0, strategy="BREAKOUT")
+                trade_id = stats.add_signal(bsig["symbol"], bsig["raw_dir"], bsig["price"], bsig.get("confidence", 0), strategy="BREAKOUT")
                 text = format_breakout_signal(bsig) + f"\n🆔 *Trade ID*: `{trade_id}`"
                 await telegram_bot.send_message(
                     chat_id=CHAT_ID, text=text, parse_mode="Markdown"
@@ -665,7 +665,7 @@ async def scan_and_send(context=None):
             htf_bias = analyzer.get_htf_bias(td_symbol, symbol)
             psig = pullback_analyzer.analyze(symbol, df, htf_bias)
             if psig:
-                trade_id = stats.add_signal(psig["symbol"], psig["raw_dir"], psig["price"], 0, strategy="PULLBACK")
+                trade_id = stats.add_signal(psig["symbol"], psig["raw_dir"], psig["price"], psig.get("confidence", 0), strategy="PULLBACK")
                 text = format_pullback_signal(psig) + f"\n🆔 *Trade ID*: `{trade_id}`"
                 await telegram_bot.send_message(
                     chat_id=CHAT_ID, text=text, parse_mode="Markdown"
@@ -680,7 +680,7 @@ async def scan_and_send(context=None):
         try:
             ssig = structure_analyzer.analyze(symbol, df)
             if ssig:
-                trade_id = stats.add_signal(ssig["symbol"], ssig["raw_dir"], ssig["price"], 0, strategy="STRUCTURE")
+                trade_id = stats.add_signal(ssig["symbol"], ssig["raw_dir"], ssig["price"], ssig.get("confidence", 0), strategy="STRUCTURE")
                 text = format_structure_signal(ssig) + f"\n🆔 *Trade ID*: `{trade_id}`"
                 await telegram_bot.send_message(
                     chat_id=CHAT_ID, text=text, parse_mode="Markdown"
@@ -695,7 +695,7 @@ async def scan_and_send(context=None):
         try:
             msig = meanrev_analyzer.analyze(symbol, df, htf_bias)
             if msig:
-                trade_id = stats.add_signal(msig["symbol"], msig["raw_dir"], msig["price"], 0, strategy="MEANREV")
+                trade_id = stats.add_signal(msig["symbol"], msig["raw_dir"], msig["price"], msig.get("confidence", 0), strategy="MEANREV")
                 text = format_meanrev_signal(msig) + f"\n🆔 *Trade ID*: `{trade_id}`"
                 await telegram_bot.send_message(
                     chat_id=CHAT_ID, text=text, parse_mode="Markdown"
