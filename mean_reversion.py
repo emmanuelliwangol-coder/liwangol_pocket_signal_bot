@@ -54,6 +54,8 @@ SL_BUFFER_PCT = {
 # TP as fraction of the distance from entry back to the mean (mid band)
 TP_MEAN_FRACTIONS = [0.6, 1.0, 1.4]   # TP1 = 60% of the way to the mean, TP3 overshoots slightly
 
+MIN_CONFIDENCE = 50   # signals below this score are skipped, not sent
+
 
 # ──────────────────────────────────────────────────
 # STATE
@@ -125,6 +127,33 @@ def _rsi(close, window=RSI_WINDOW):
 
 
 # ──────────────────────────────────────────────────
+# CONFIDENCE SCORER
+# ──────────────────────────────────────────────────
+def _score_meanrev_confidence(direction, r, o, h, l, c, band_extreme, band_penetration_ref):
+    # 1. RSI extremity — how far past the 30/70 threshold (more extreme = higher confidence)
+    if direction == "CALL":
+        rsi_extremity = max(0, min(100, ((RSI_OVERSOLD - r) / RSI_OVERSOLD) * 200))
+    else:
+        rsi_extremity = max(0, min(100, ((r - RSI_OVERBOUGHT) / (100 - RSI_OVERBOUGHT)) * 200))
+
+    # 2. Band penetration depth — how far price pushed beyond the band,
+    #    relative to the band's own reference distance (deeper = higher)
+    penetration = abs((l if direction == "CALL" else h) - band_extreme)
+    band_depth = min(100, (penetration / band_penetration_ref) * 300) if band_penetration_ref else 0
+
+    # 3. Rejection candle quality — wick-to-range ratio (same style as other modules)
+    total = h - l
+    if direction == "CALL":
+        wick = min(o, c) - l
+    else:
+        wick = h - max(o, c)
+    candle_quality = min(100, (wick / total) * 150) if total > 0 else 0
+
+    confidence = round(0.35 * rsi_extremity + 0.30 * band_depth + 0.35 * candle_quality)
+    return max(0, min(100, confidence))
+
+
+# ──────────────────────────────────────────────────
 # MEAN REVERSION ANALYZER
 # ──────────────────────────────────────────────────
 class MeanReversionAnalyzer:
@@ -173,6 +202,13 @@ class MeanReversionAnalyzer:
         if direction is None:
             return None
 
+        band_penetration_ref = abs(u - m)   # half the band width, used as a depth reference
+        band_extreme_val = lo if direction == "CALL" else u
+        confidence = _score_meanrev_confidence(direction, r, o, h, l, c, band_extreme_val, band_penetration_ref)
+        if confidence < MIN_CONFIDENCE:
+            log.info(f"[MEANREV] {symbol} {direction} confidence {confidence}% < {MIN_CONFIDENCE}% — skip")
+            return None
+
         buf = SL_BUFFER_PCT.get(symbol, SL_BUFFER_PCT["DEFAULT"])
         dist_to_mean = abs(m - c)
 
@@ -192,13 +228,14 @@ class MeanReversionAnalyzer:
             "price": round(c, 5),
             "rsi": round(r, 1),
             "band_mean": round(m, 5),
-            "band_extreme": round(lo if direction == "CALL" else u, 5),
+            "band_extreme": round(band_extreme_val, 5),
+            "confidence": confidence,
             "sl": sl, "tp1": tps[0], "tp2": tps[1], "tp3": tps[2],
             "pattern": "Pin Bar" if (_is_bullish_pin_bar(o,h,l,c) or _is_bearish_pin_bar(o,h,l,c)) else "Engulfing",
             "strategy": "MEANREV",
             "session": "🔁 Mean Reversion (Ranging)",
         }
-        log.info(f"[MEANREV] {symbol} {direction} fired — RSI {r:.1f}, band touch at {result['band_extreme']}")
+        log.info(f"[MEANREV] {symbol} {direction} fired — confidence {confidence}%, RSI {r:.1f}, band touch at {result['band_extreme']}")
         return result
 
 
@@ -215,6 +252,10 @@ def pd_isnan(x):
 # ──────────────────────────────────────────────────
 def format_meanrev_signal(sig):
     now = datetime.utcnow()
+    conf = sig.get("confidence", 0)
+    conf_label = "🔥 ELITE" if conf >= 85 else "💎 HIGH" if conf >= 70 else "✅ GOOD"
+    filled = round(conf / 10)
+    bar = "🟢" * filled + "⬜" * (10 - filled)
     return (
         f"🚨 *MEAN REVERSION SIGNAL*\n"
         f"━━━━━━━━━━━━━━━━━━━━━━\n"
@@ -230,6 +271,9 @@ def format_meanrev_signal(sig):
         f"✅ *TP1 (mean)*: `{sig['tp1']}`\n"
         f"✅ *TP2*: `{sig['tp2']}`\n"
         f"✅ *TP3*: `{sig['tp3']}`\n"
+        f"━━━━━━━━━━━━━━━━━━━━━━\n"
+        f"📊 *Confidence*: {conf_label}\n"
+        f"{bar} `{conf}%`\n"
         f"━━━━━━━━━━━━━━━━━━━━━━\n"
         f"🕐 `{now.strftime('%H:%M:%S UTC')}`\n"
         f"⚠️ _Risk management always applies_\n"
