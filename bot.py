@@ -231,14 +231,17 @@ class StatsManager:
                 return json.load(f)
         return {"total":0,"wins":0,"losses":0,"pending":[],
                 "pairs":{},"daily":{},"streak":0,"best_streak":0,
-                "strategies":{}}
+                "strategies":{}, "next_id":1}
 
     def _save(self):
         with open(STATS_FILE,"w") as f:
             json.dump(self.data, f, indent=2, default=str)
 
     def add_signal(self, symbol, direction, price, score, strategy="SMC"):
+        trade_id = f"T{self.data.get('next_id', 1)}"
+        self.data["next_id"] = self.data.get("next_id", 1) + 1
         self.data["pending"].append({
+            "id": trade_id,
             "symbol": symbol, "direction": direction,
             "entry_price": price, "score": score,
             "strategy": strategy,
@@ -247,6 +250,7 @@ class StatsManager:
             "expiry_time": (datetime.utcnow()+timedelta(minutes=EXPIRY_MIN)).isoformat(),
         })
         self._save()
+        return trade_id
 
     def record_result(self, symbol, win, strategy="SMC"):
         today = datetime.utcnow().strftime("%Y-%m-%d")
@@ -612,13 +616,14 @@ async def scan_and_send(context=None):
         sig, sig_type = analyzer.analyze(symbol, td_symbol, df=df)
         if sig and sig_type == "signal":
             try:
+                trade_id = stats.add_signal(sig["symbol"], sig["raw_dir"], sig["price"], sig["score"], strategy="SMC")
+                text = format_signal(sig) + f"\n🆔 *Trade ID*: `{trade_id}`"
                 await telegram_bot.send_message(
-                    chat_id=CHAT_ID, text=format_signal(sig), parse_mode="Markdown"
+                    chat_id=CHAT_ID, text=text, parse_mode="Markdown"
                 )
-                stats.add_signal(sig["symbol"], sig["raw_dir"], sig["price"], sig["score"], strategy="SMC")
                 presignal_sent.pop(symbol, None)
                 sent += 1
-                log.info(f"[SMC] Signal sent: {symbol} {sig['direction']} score={sig['score']}")
+                log.info(f"[SMC] Signal sent: {symbol} {sig['direction']} score={sig['score']} id={trade_id}")
                 await asyncio.sleep(2)
             except Exception as e:
                 log.error(f"[SMC] Send error {symbol}: {e}")
@@ -644,12 +649,13 @@ async def scan_and_send(context=None):
         try:
             bsig = breakout_analyzer.analyze(symbol, df)
             if bsig:
+                trade_id = stats.add_signal(bsig["symbol"], bsig["raw_dir"], bsig["price"], 0, strategy="BREAKOUT")
+                text = format_breakout_signal(bsig) + f"\n🆔 *Trade ID*: `{trade_id}`"
                 await telegram_bot.send_message(
-                    chat_id=CHAT_ID, text=format_breakout_signal(bsig), parse_mode="Markdown"
+                    chat_id=CHAT_ID, text=text, parse_mode="Markdown"
                 )
-                stats.add_signal(bsig["symbol"], bsig["raw_dir"], bsig["price"], 0, strategy="BREAKOUT")
                 sent += 1
-                log.info(f"[BREAKOUT] Signal sent: {symbol} {bsig['direction']}")
+                log.info(f"[BREAKOUT] Signal sent: {symbol} {bsig['direction']} id={trade_id}")
                 await asyncio.sleep(2)
         except Exception as e:
             log.error(f"[BREAKOUT] Error {symbol}: {e}")
@@ -659,12 +665,13 @@ async def scan_and_send(context=None):
             htf_bias = analyzer.get_htf_bias(td_symbol, symbol)
             psig = pullback_analyzer.analyze(symbol, df, htf_bias)
             if psig:
+                trade_id = stats.add_signal(psig["symbol"], psig["raw_dir"], psig["price"], 0, strategy="PULLBACK")
+                text = format_pullback_signal(psig) + f"\n🆔 *Trade ID*: `{trade_id}`"
                 await telegram_bot.send_message(
-                    chat_id=CHAT_ID, text=format_pullback_signal(psig), parse_mode="Markdown"
+                    chat_id=CHAT_ID, text=text, parse_mode="Markdown"
                 )
-                stats.add_signal(psig["symbol"], psig["raw_dir"], psig["price"], 0, strategy="PULLBACK")
                 sent += 1
-                log.info(f"[PULLBACK] Signal sent: {symbol} {psig['direction']}")
+                log.info(f"[PULLBACK] Signal sent: {symbol} {psig['direction']} id={trade_id}")
                 await asyncio.sleep(2)
         except Exception as e:
             log.error(f"[PULLBACK] Error {symbol}: {e}")
@@ -673,12 +680,13 @@ async def scan_and_send(context=None):
         try:
             ssig = structure_analyzer.analyze(symbol, df)
             if ssig:
+                trade_id = stats.add_signal(ssig["symbol"], ssig["raw_dir"], ssig["price"], 0, strategy="STRUCTURE")
+                text = format_structure_signal(ssig) + f"\n🆔 *Trade ID*: `{trade_id}`"
                 await telegram_bot.send_message(
-                    chat_id=CHAT_ID, text=format_structure_signal(ssig), parse_mode="Markdown"
+                    chat_id=CHAT_ID, text=text, parse_mode="Markdown"
                 )
-                stats.add_signal(ssig["symbol"], ssig["raw_dir"], ssig["price"], 0, strategy="STRUCTURE")
                 sent += 1
-                log.info(f"[STRUCTURE] Signal sent: {symbol} {ssig['direction']}")
+                log.info(f"[STRUCTURE] Signal sent: {symbol} {ssig['direction']} id={trade_id}")
                 await asyncio.sleep(2)
         except Exception as e:
             log.error(f"[STRUCTURE] Error {symbol}: {e}")
@@ -687,12 +695,13 @@ async def scan_and_send(context=None):
         try:
             msig = meanrev_analyzer.analyze(symbol, df, htf_bias)
             if msig:
+                trade_id = stats.add_signal(msig["symbol"], msig["raw_dir"], msig["price"], 0, strategy="MEANREV")
+                text = format_meanrev_signal(msig) + f"\n🆔 *Trade ID*: `{trade_id}`"
                 await telegram_bot.send_message(
-                    chat_id=CHAT_ID, text=format_meanrev_signal(msig), parse_mode="Markdown"
+                    chat_id=CHAT_ID, text=text, parse_mode="Markdown"
                 )
-                stats.add_signal(msig["symbol"], msig["raw_dir"], msig["price"], 0, strategy="MEANREV")
                 sent += 1
-                log.info(f"[MEANREV] Signal sent: {symbol} {msig['direction']}")
+                log.info(f"[MEANREV] Signal sent: {symbol} {msig['direction']} id={trade_id}")
                 await asyncio.sleep(2)
         except Exception as e:
             log.error(f"[MEANREV] Error {symbol}: {e}")
@@ -724,14 +733,19 @@ async def cmd_help(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "📋 *Commands*\n\n"
         "/start — Bot info\n"
         "/stats — Performance report (per strategy + per pair)\n"
+        "/pending — List open signals with Trade IDs\n"
         "/pairs — Active pairs\n"
         "/session — Session status\n"
         "/scan — Force immediate scan\n\n"
         "📝 *After each trade:*\n"
-        "/win — Record last signal as WIN\n"
-        "/win XAUUSD — Record WIN for specific pair\n"
-        "/loss — Record last signal as LOSS\n"
-        "/loss EURUSD — Record LOSS for specific pair\n\n"
+        "/win T7 — Record a SPECIFIC trade as WIN (recommended)\n"
+        "/loss T7 — Record a SPECIFIC trade as LOSS (recommended)\n"
+        "/win — Record most recent signal as WIN\n"
+        "/win XAUUSD — Record WIN for most recent signal on that pair\n"
+        "/loss — Record most recent signal as LOSS\n\n"
+        "💡 Every signal now includes a 🆔 Trade ID (e.g. `T7`). "
+        "When multiple signals are open at once, use `/pending` to see "
+        "them all, then reply with the exact ID so the right trade gets recorded.\n\n"
         "/pause — Pause signals\n"
         "/resume — Resume signals\n"
         "/help — This message",
@@ -764,11 +778,30 @@ async def cmd_scan(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await scan_and_send()
     await update.message.reply_text("✅ Scan complete.", parse_mode="Markdown")
 
+async def cmd_pending(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    pending = stats.data.get("pending", [])
+    if not pending:
+        await update.message.reply_text("✅ No open signals right now.", parse_mode="Markdown")
+        return
+    lines = []
+    for e in pending:
+        lines.append(
+            f"🆔 `{e.get('id','?')}`  |  `{e['symbol']}`  |  🧩 `{e.get('strategy','SMC')}`  |  {e.get('direction','')}"
+        )
+    await update.message.reply_text(
+        f"📋 *Open Signals ({len(pending)})*\n━━━━━━━━━━━━━━━━━━━━━━\n" +
+        "\n".join(lines) +
+        f"\n━━━━━━━━━━━━━━━━━━━━━━\nUse `/win T7` or `/loss T7` to record a specific one.",
+        parse_mode="Markdown")
+
 def _pop_pending(context_args: list) -> dict | None:
     """
-    Pop the most recent pending signal.
-    Supports: /win, /win XAUUSD, /win SMC, /win BREAKOUT,
-    or /win XAUUSD SMC to match both symbol and strategy.
+    Pop a specific pending signal.
+    Priority order:
+      1. Exact Trade ID match — /win T7 (recommended when multiple
+         signals are open at once, since this is unambiguous)
+      2. Symbol/strategy match — /win XAUUSD, /win SMC, /win XAUUSD SMC
+      3. No args — falls back to the most recent pending signal
     """
     pending = stats.data.get("pending", [])
     if not pending:
@@ -777,6 +810,14 @@ def _pop_pending(context_args: list) -> dict | None:
         return pending.pop()
 
     args = [a.upper() for a in context_args]
+
+    # 1. Try Trade ID first (e.g. "T7")
+    id_arg = args[0]
+    for i in range(len(pending) - 1, -1, -1):
+        if pending[i].get("id", "").upper() == id_arg:
+            return pending.pop(i)
+
+    # 2. Fall back to symbol/strategy matching
     strategies = {"SMC", "BREAKOUT", "PULLBACK", "STRUCTURE", "MEANREV"}
     symbol_arg   = next((a for a in args if a not in strategies), None)
     strategy_arg = next((a for a in args if a in strategies), None)
@@ -814,6 +855,7 @@ async def cmd_win(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(
         f"✅ *WIN RECORDED!*\n"
         f"━━━━━━━━━━━━━━━━━━━━━━\n"
+        f"🆔 Trade: `{entry.get('id','?')}`\n"
         f"💱 Pair: `{entry['symbol']}`  |  🧩 `{strategy}`\n"
         f"📍 Session: {entry.get('session','')}\n"
         f"━━━━━━━━━━━━━━━━━━━━━━\n"
@@ -846,6 +888,7 @@ async def cmd_loss(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(
         f"❌ *LOSS RECORDED*\n"
         f"━━━━━━━━━━━━━━━━━━━━━━\n"
+        f"🆔 Trade: `{entry.get('id','?')}`\n"
         f"💱 Pair: `{entry['symbol']}`  |  🧩 `{strategy}`\n"
         f"📍 Session: {entry.get('session','')}\n"
         f"━━━━━━━━━━━━━━━━━━━━━━\n"
@@ -918,6 +961,7 @@ def main():
     app.add_handler(CommandHandler("pairs",   cmd_pairs))
     app.add_handler(CommandHandler("session", cmd_session))
     app.add_handler(CommandHandler("scan",    cmd_scan))
+    app.add_handler(CommandHandler("pending", cmd_pending))
     app.add_handler(CommandHandler("win",     cmd_win))
     app.add_handler(CommandHandler("loss",    cmd_loss))
     app.add_handler(CommandHandler("pause",   cmd_pause))
