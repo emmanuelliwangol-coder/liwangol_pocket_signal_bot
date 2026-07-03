@@ -2,7 +2,7 @@
 ╔══════════════════════════════════════════════════╗
 ║   POCKET OPTION SIGNAL BOT — SMC PRO EDITION   ║
 ║   Data: Twelve Data API (replaces yfinance)     ║
-║   Expiry: 3 min | Sessions: London + NY         ║
+║   Strategies: SMC + London Breakout             ║
 ╚══════════════════════════════════════════════════╝
 """
 
@@ -19,6 +19,11 @@ from pathlib import Path
 from telegram import Update
 from telegram.ext import Application, CommandHandler, ContextTypes
 
+from london_breakout import (
+    LondonBreakoutAnalyzer,
+    format_breakout_signal,
+)
+
 # ──────────────────────────────────────────────────
 # CONFIG
 # ──────────────────────────────────────────────────
@@ -28,17 +33,14 @@ TD_API_KEY   = os.getenv("TD_API_KEY", "")
 EXPIRY_MIN      = 3
 SCAN_EVERY      = 5
 MIN_SCORE       = 2
-MIN_CONFIDENCE  = 55        # Only send signals with confidence >= this %
-PRE_SIGNAL_MIN  = 45        # Send pre-signal alert at this confidence level
-MAX_SCORE       = 7         # Total possible confluence points
+MIN_CONFIDENCE  = 55
+PRE_SIGNAL_MIN  = 45
+MAX_SCORE       = 7
 STATS_FILE      = "stats.json"
 
-# Webhook — set WEBHOOK_URL env var in Railway to your service URL
-# e.g. https://your-service.up.railway.app
-WEBHOOK_URL  = os.getenv("WEBHOOK_URL", "")   # REQUIRED for Railway
-WEBHOOK_PORT = int(os.getenv("PORT", "8080"))  # Railway sets PORT automatically
+WEBHOOK_URL  = os.getenv("WEBHOOK_URL", "")
+WEBHOOK_PORT = int(os.getenv("PORT", "8080"))
 
-# Twelve Data symbols
 PAIRS = {
     "XAUUSD": "XAU/USD",
     "EURUSD": "EUR/USD",
@@ -66,18 +68,13 @@ log = logging.getLogger(__name__)
 # SESSION HELPERS
 # ──────────────────────────────────────────────────
 def is_weekend():
-    """Returns True on Saturday and Sunday (UTC)."""
-    return datetime.utcnow().weekday() >= 5  # 5=Saturday, 6=Sunday
+    return datetime.utcnow().weekday() >= 5
 
 def is_active_session(symbol: str = ""):
-    """
-    Forex/Gold: only active Mon-Fri during London/NY sessions.
-    BTC: active 24/7 including weekends.
-    """
     if symbol == "BTCUSD":
-        return True   # Crypto never closes
+        return True
     if is_weekend():
-        return False  # Forex/Gold closed on weekends
+        return False
     hour = datetime.utcnow().hour
     return any(s <= hour < e for s, e in SESSIONS)
 
@@ -97,7 +94,7 @@ def session_name(symbol: str = ""):
     return "😴 Off-Session"
 
 # ──────────────────────────────────────────────────
-# TWELVE DATA FETCHER
+# TWELVE DATA FETCHER  (now preserves timestamps — required by London Breakout)
 # ──────────────────────────────────────────────────
 def fetch_candles(symbol: str, interval="1min", outputsize=100) -> pd.DataFrame | None:
     url = "https://api.twelvedata.com/time_series"
@@ -116,12 +113,15 @@ def fetch_candles(symbol: str, interval="1min", outputsize=100) -> pd.DataFrame 
             return None
         df = pd.DataFrame(data["values"])
         df = df.rename(columns={
+            "datetime": "Datetime",
             "open": "Open", "high": "High",
             "low": "Low",  "close": "Close",
             "volume": "Volume"
         })
         for col in ["Open","High","Low","Close"]:
             df[col] = pd.to_numeric(df[col])
+        if "Datetime" in df.columns:
+            df["Datetime"] = pd.to_datetime(df["Datetime"])
         df = df.iloc[::-1].reset_index(drop=True)  # oldest first
         return df
     except Exception as e:
@@ -148,6 +148,7 @@ def fetch_binance_candles(symbol: str = "BTCUSDT", interval: str = "1m", limit: 
         ])
         for col in ["Open","High","Low","Close"]:
             df[col] = pd.to_numeric(df[col])
+        df["Datetime"] = pd.to_datetime(df["OpenTime"], unit="ms")
         return df.reset_index(drop=True)
     except Exception as e:
         log.warning(f"Binance fetch error {symbol}: {e}")
@@ -157,32 +158,21 @@ def fetch_binance_htf(symbol: str = "BTCUSDT"):
     return fetch_binance_candles(symbol, interval="1h", limit=200)
 
 # ──────────────────────────────────────────────────
-# SL / TP CALCULATOR
+# SL / TP CALCULATOR (SMC strategy)
 # ──────────────────────────────────────────────────
 def calculate_sl_tp(entry: float, direction: str, symbol: str):
-    """
-    MT5-optimized SL/TP levels with proper room to breathe.
-    Risk:Reward = 1:1.5 / 1:2 / 1:3 across TP1/TP2/TP3
-    """
     if symbol == "XAUUSD":
-        # Gold: SL ~$2.00 (20 pips), TPs at 1.5R / 2R / 3R
-        sl_pct  = 0.0012   # ~$2.00 SL on gold
-        tp_pcts = [0.0018, 0.0024, 0.0036]   # 1.5R / 2R / 3R
-
+        sl_pct  = 0.0012
+        tp_pcts = [0.0018, 0.0024, 0.0036]
     elif symbol == "BTCUSD":
-        # BTC: SL ~$250-300, TPs proportional
-        sl_pct  = 0.0040   # ~$250 SL on BTC
-        tp_pcts = [0.0060, 0.0080, 0.0120]   # 1.5R / 2R / 3R
-
+        sl_pct  = 0.0040
+        tp_pcts = [0.0060, 0.0080, 0.0120]
     elif symbol in ("USDJPY",):
-        # JPY pairs: SL 20 pips (pip = 0.01)
         sl_pct  = 0.0020
         tp_pcts = [0.0030, 0.0040, 0.0060]
-
     else:
-        # Major forex (EURUSD, GBPUSD, AUDUSD etc): SL 20-25 pips
-        sl_pct  = 0.0020   # ~20-25 pips
-        tp_pcts = [0.0030, 0.0040, 0.0060]   # 1.5R / 2R / 3R
+        sl_pct  = 0.0020
+        tp_pcts = [0.0030, 0.0040, 0.0060]
 
     if direction == "CALL":
         sl  = round(entry * (1 - sl_pct), 5)
@@ -197,7 +187,7 @@ def calculate_sl_tp(entry: float, direction: str, symbol: str):
     return sl, tp1, tp2, tp3
 
 # ──────────────────────────────────────────────────
-# STATS MANAGER
+# STATS MANAGER  (now tracks per-strategy results too)
 # ──────────────────────────────────────────────────
 class StatsManager:
     def __init__(self):
@@ -208,23 +198,25 @@ class StatsManager:
             with open(STATS_FILE) as f:
                 return json.load(f)
         return {"total":0,"wins":0,"losses":0,"pending":[],
-                "pairs":{},"daily":{},"streak":0,"best_streak":0}
+                "pairs":{},"daily":{},"streak":0,"best_streak":0,
+                "strategies":{}}
 
     def _save(self):
         with open(STATS_FILE,"w") as f:
             json.dump(self.data, f, indent=2, default=str)
 
-    def add_signal(self, symbol, direction, price, score):
+    def add_signal(self, symbol, direction, price, score, strategy="SMC"):
         self.data["pending"].append({
             "symbol": symbol, "direction": direction,
             "entry_price": price, "score": score,
+            "strategy": strategy,
             "session": session_name(symbol),
             "entry_time": datetime.utcnow().isoformat(),
             "expiry_time": (datetime.utcnow()+timedelta(minutes=EXPIRY_MIN)).isoformat(),
         })
         self._save()
 
-    def record_result(self, symbol, win):
+    def record_result(self, symbol, win, strategy="SMC"):
         today = datetime.utcnow().strftime("%Y-%m-%d")
         self.data["total"] += 1
         if win:
@@ -239,6 +231,9 @@ class StatsManager:
         self.data["pairs"][symbol]["wins" if win else "losses"] += 1
         self.data["daily"].setdefault(today, {"wins":0,"losses":0})
         self.data["daily"][today]["wins" if win else "losses"] += 1
+        self.data.setdefault("strategies", {})
+        self.data["strategies"].setdefault(strategy, {"wins":0,"losses":0})
+        self.data["strategies"][strategy]["wins" if win else "losses"] += 1
         self._save()
 
     def get_win_rate(self):
@@ -269,8 +264,16 @@ class StatsManager:
             rate = round(rec["wins"]/tot*100,1) if tot else 0
             bar = "🟩" if rate>=60 else "🟨" if rate>=50 else "🟥"
             pb += f"  {bar} `{sym}`: {rec['wins']}W/{rec['losses']}L ({rate}%)\n"
+
+        sb = ""
+        for strat, rec in d.get("strategies", {}).items():
+            tot = rec["wins"]+rec["losses"]
+            rate = round(rec["wins"]/tot*100,1) if tot else 0
+            bar = "🟩" if rate>=60 else "🟨" if rate>=50 else "🟥"
+            sb += f"  {bar} `{strat}`: {rec['wins']}W/{rec['losses']}L ({rate}%)\n"
+
         return (
-            f"📊 *BOT PERFORMANCE — SMC PRO*\n"
+            f"📊 *BOT PERFORMANCE — MULTI-STRATEGY*\n"
             f"━━━━━━━━━━━━━━━━━━━━━━\n"
             f"🏆 *Win Rate*\n{self._bar(wr)} `{wr}%`\n\n"
             f"📈 Total: `{d['total']}`\n"
@@ -278,14 +281,14 @@ class StatsManager:
             f"📅 *Today*: ✅ {today['wins']}W  ❌ {today['losses']}L\n\n"
             f"🔥 Streak: `{d.get('streak',0)}`  🥇 Best: `{d.get('best_streak',0)}`\n"
             f"💎 Best Pair: `{self.get_best_pair()}`\n\n"
-            f"📊 *Pair Breakdown*\n{pb}"
+            f"📊 *Pair Breakdown*\n{pb}\n"
+            f"🧩 *Strategy Breakdown*\n{sb}"
             f"━━━━━━━━━━━━━━━━━━━━━━\n"
-            f"⏱ Expiry: `{EXPIRY_MIN} minutes`\n"
             f"🕐 `{datetime.utcnow().strftime('%H:%M UTC')}`"
         )
 
 # ──────────────────────────────────────────────────
-# SMC PRO ANALYSIS ENGINE
+# SMC PRO ANALYSIS ENGINE  (unchanged from your validated 15M/1H version)
 # ──────────────────────────────────────────────────
 class SMCProAnalyzer:
 
@@ -383,11 +386,12 @@ class SMCProAnalyzer:
             "bull_bb":  lc<=bbl,   "bear_bb":  lc>=bbh,
         }
 
-    def analyze(self, symbol, td_symbol):
+    def analyze(self, symbol, td_symbol, df=None):
         if not is_active_session(symbol):
             return None, None
 
-        df = fetch_candles(td_symbol, interval="15min", outputsize=100)
+        if df is None:
+            df = fetch_candles(td_symbol, interval="15min", outputsize=100)
         if df is None or len(df) < 60:
             return None, None
 
@@ -428,7 +432,6 @@ class SMCProAnalyzer:
             log.info(f"{symbol} score {score} < {MIN_SCORE} — skip")
             return None, None
 
-        # ── Confidence score ──────────────────────────────────────
         confidence = round((score / MAX_SCORE) * 100)
 
         htf = self.get_htf_bias(td_symbol, symbol)
@@ -440,7 +443,6 @@ class SMCProAnalyzer:
         if rsi_hit and bb_hit:
             confidence = min(confidence + 5, 100)
 
-        # All detected tags (active = confirmed, pending = missing)
         all_tags = tags
         pending  = [tags[i] for i,h in enumerate(hits) if not h]
 
@@ -465,10 +467,9 @@ class SMCProAnalyzer:
             return None, None
 
 # ──────────────────────────────────────────────────
-# SIGNAL FORMATTER
+# SIGNAL FORMATTER (SMC)
 # ──────────────────────────────────────────────────
 def confidence_bar(pct: int) -> str:
-    """Visual bar for confidence percentage."""
     filled = round(pct / 10)
     bar = "🟢" * filled + "⬜" * (10 - filled)
     return f"{bar} `{pct}%`"
@@ -482,7 +483,6 @@ def format_signal(sig):
     conf   = sig["confidence"]
     sl,tp1,tp2,tp3 = calculate_sl_tp(entry, sig["raw_dir"], sig["symbol"])
 
-    # Confidence label
     if conf >= 90:
         conf_label = "🔥 ELITE"
     elif conf >= 80:
@@ -491,7 +491,7 @@ def format_signal(sig):
         conf_label = "✅ GOOD"
 
     return (
-        f"🚨 *POCKET OPTION SIGNAL*\n"
+        f"🚨 *SMC SIGNAL*\n"
         f"━━━━━━━━━━━━━━━━━━━━━━\n"
         f"💱 Pair: `{sig['symbol']}`\n"
         f"🎯 Direction: *{sig['direction']}*\n"
@@ -514,7 +514,7 @@ def format_signal(sig):
         f"💥 Strength: *{sig['strength']}*\n"
         f"🕐 `{now.strftime('%H:%M:%S UTC')}`\n"
         f"⚠️ _Risk management always applies_\n"
-        f"📝 _Reply /win or /loss after trade_"
+        f"📝 _Reply /win SMC or /loss SMC after trade_"
     )
 
 def format_presignal(sig):
@@ -548,61 +548,76 @@ def format_presignal(sig):
 # ──────────────────────────────────────────────────
 # BOT STATE
 # ──────────────────────────────────────────────────
-bot_paused      = False
-stats           = StatsManager()
-analyzer        = SMCProAnalyzer()
-telegram_bot    = None
-presignal_sent  = {}   # symbol -> last presignal confidence (avoid spam)
+bot_paused        = False
+stats             = StatsManager()
+analyzer          = SMCProAnalyzer()
+breakout_analyzer = LondonBreakoutAnalyzer()
+telegram_bot      = None
+presignal_sent    = {}
 
 # ──────────────────────────────────────────────────
-# SCANNER
+# SCANNER  (now runs SMC + Breakout off the same fetched candles)
 # ──────────────────────────────────────────────────
 async def scan_and_send(context=None):
     global presignal_sent
     if bot_paused or telegram_bot is None:
         return
-    # Each pair decides its own session via analyze(symbol)
-    # BTC scans 24/7, forex/gold only during London/NY on weekdays
     log.info(f"🔍 Scanning | {session_name()}")
     sent = 0
     for symbol, td_symbol in PAIRS.items():
-        await asyncio.sleep(15)   # 15s gap = max 4 calls/min, well under free plan limit
-        sig, sig_type = analyzer.analyze(symbol, td_symbol)
+        await asyncio.sleep(15)
+
+        # Fetch once, reuse for both strategies
+        if symbol == "BTCUSD":
+            df = fetch_binance_candles("BTCUSDT", interval="15m", limit=100)
+        else:
+            df = fetch_candles(td_symbol, interval="15min", outputsize=100)
+
+        # ── SMC strategy ──
+        sig, sig_type = analyzer.analyze(symbol, td_symbol, df=df)
         if sig and sig_type == "signal":
             try:
                 await telegram_bot.send_message(
-                    chat_id=CHAT_ID,
-                    text=format_signal(sig),
-                    parse_mode="Markdown"
+                    chat_id=CHAT_ID, text=format_signal(sig), parse_mode="Markdown"
                 )
-                stats.add_signal(sig["symbol"],sig["raw_dir"],sig["price"],sig["score"])
-                presignal_sent.pop(symbol, None)   # clear presignal tracker
+                stats.add_signal(sig["symbol"], sig["raw_dir"], sig["price"], sig["score"], strategy="SMC")
+                presignal_sent.pop(symbol, None)
                 sent += 1
-                log.info(f"Signal sent: {symbol} {sig['direction']} score={sig['score']}")
+                log.info(f"[SMC] Signal sent: {symbol} {sig['direction']} score={sig['score']}")
                 await asyncio.sleep(2)
             except Exception as e:
-                log.error(f"Send error {symbol}: {e}")
-
+                log.error(f"[SMC] Send error {symbol}: {e}")
         elif sig and sig_type == "presignal":
-            # Only send presignal if confidence jumped since last alert
             last_conf = presignal_sent.get(symbol, 0)
-            if sig["confidence"] >= last_conf + 5:   # only alert on 5%+ jump
+            if sig["confidence"] >= last_conf + 5:
                 try:
                     await telegram_bot.send_message(
-                        chat_id=CHAT_ID,
-                        text=format_presignal(sig),
-                        parse_mode="Markdown"
+                        chat_id=CHAT_ID, text=format_presignal(sig), parse_mode="Markdown"
                     )
                     presignal_sent[symbol] = sig["confidence"]
                     sent += 1
-                    log.info(f"Pre-signal sent: {symbol} conf={sig['confidence']}%")
+                    log.info(f"[SMC] Pre-signal sent: {symbol} conf={sig['confidence']}%")
                     await asyncio.sleep(2)
                 except Exception as e:
-                    log.error(f"Pre-signal send error {symbol}: {e}")
+                    log.error(f"[SMC] Pre-signal send error {symbol}: {e}")
             else:
-                log.info(f"Pre-signal suppressed: {symbol} conf={sig['confidence']}% (last={last_conf}%)")
+                log.info(f"[SMC] Pre-signal suppressed: {symbol} conf={sig['confidence']}%")
         else:
-            presignal_sent.pop(symbol, None)   # reset if setup disappeared
+            presignal_sent.pop(symbol, None)
+
+        # ── London Breakout strategy ──
+        try:
+            bsig = breakout_analyzer.analyze(symbol, df)
+            if bsig:
+                await telegram_bot.send_message(
+                    chat_id=CHAT_ID, text=format_breakout_signal(bsig), parse_mode="Markdown"
+                )
+                stats.add_signal(bsig["symbol"], bsig["raw_dir"], bsig["price"], 0, strategy="BREAKOUT")
+                sent += 1
+                log.info(f"[BREAKOUT] Signal sent: {symbol} {bsig['direction']}")
+                await asyncio.sleep(2)
+        except Exception as e:
+            log.error(f"[BREAKOUT] Error {symbol}: {e}")
 
     if sent == 0:
         log.info("No qualifying signals.")
@@ -612,19 +627,14 @@ async def scan_and_send(context=None):
 # ──────────────────────────────────────────────────
 async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(
-        "👋 *Pocket Option Signal Bot — SMC PRO*\n\n"
+        "👋 *Multi-Strategy Signal Bot*\n\n"
+        f"⚙️ *Active Strategies*\n"
+        f"• 🧠 SMC PRO (15M entries, 1H HTF bias)\n"
+        f"• 🇬🇧 London Breakout (session range breakout)\n\n"
         f"⚙️ *Settings*\n"
-        f"• Expiry: `{EXPIRY_MIN} minutes`\n"
-        f"• Min Score: `{MIN_SCORE}/7`\n"
-        f"• Min Confidence: `{MIN_CONFIDENCE}%` _(only HIGH confidence signals sent)_\n"
-        f"• Sessions: London + New York\n"
-        f"• Data: Twelve Data API ✅\n"
+        f"• Min SMC Score: `{MIN_SCORE}/7`\n"
+        f"• Min Confidence: `{MIN_CONFIDENCE}%`\n"
         f"• Pairs: XAUUSD, EURUSD, GBPUSD, USDJPY, BTCUSD\n\n"
-        f"🧠 *Active Filters*\n"
-        f"• HTF Trend Bias\n• Fair Value Gap\n"
-        f"• Liquidity Sweep\n• MSS\n"
-        f"• Order Block\n• Engulfing Candle\n"
-        f"• RSI + Bollinger Bands\n• SL + TP1/TP2/TP3\n\n"
         f"Use /help for all commands.",
         parse_mode="Markdown")
 
@@ -632,7 +642,7 @@ async def cmd_help(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(
         "📋 *Commands*\n\n"
         "/start — Bot info\n"
-        "/stats — Performance report\n"
+        "/stats — Performance report (per strategy + per pair)\n"
         "/pairs — Active pairs\n"
         "/session — Session status\n"
         "/scan — Force immediate scan\n\n"
@@ -643,9 +653,7 @@ async def cmd_help(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "/loss EURUSD — Record LOSS for specific pair\n\n"
         "/pause — Pause signals\n"
         "/resume — Resume signals\n"
-        "/help — This message\n\n"
-        f"🎯 *Confidence threshold*: `{MIN_CONFIDENCE}%`\n"
-        f"Only signals with high confidence are sent.",
+        "/help — This message",
         parse_mode="Markdown")
 
 async def cmd_stats(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -654,7 +662,7 @@ async def cmd_stats(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def cmd_pairs(update: Update, context: ContextTypes.DEFAULT_TYPE):
     lines = "\n".join(f"  • `{s}`" for s in PAIRS)
     await update.message.reply_text(
-        f"📈 *Active Pairs*\n{lines}\n\n⏱ Expiry: `{EXPIRY_MIN} min`",
+        f"📈 *Active Pairs*\n{lines}",
         parse_mode="Markdown")
 
 async def cmd_session(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -677,41 +685,45 @@ async def cmd_scan(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 def _pop_pending(context_args: list) -> dict | None:
     """
-    Pop the most recent pending signal, or the most recent one matching
-    the symbol passed as an argument (e.g. /win XAUUSD).
+    Pop the most recent pending signal.
+    Supports: /win, /win XAUUSD, /win SMC, /win BREAKOUT,
+    or /win XAUUSD SMC to match both symbol and strategy.
     """
     pending = stats.data.get("pending", [])
     if not pending:
         return None
-    if context_args:
-        symbol = context_args[0].upper()
-        # Find most recent match
-        for i in range(len(pending) - 1, -1, -1):
-            if pending[i]["symbol"] == symbol:
-                return pending.pop(i)
-        return None          # symbol not found
-    return pending.pop()    # default: most recent
+    if not context_args:
+        return pending.pop()
+
+    args = [a.upper() for a in context_args]
+    strategies = {"SMC", "BREAKOUT"}
+    symbol_arg   = next((a for a in args if a not in strategies), None)
+    strategy_arg = next((a for a in args if a in strategies), None)
+
+    for i in range(len(pending) - 1, -1, -1):
+        entry = pending[i]
+        if symbol_arg and entry["symbol"] != symbol_arg:
+            continue
+        if strategy_arg and entry.get("strategy") != strategy_arg:
+            continue
+        return pending.pop(i)
+    return None
 
 async def cmd_win(update: Update, context: ContextTypes.DEFAULT_TYPE):
     pending = stats.data.get("pending", [])
     if not pending:
         await update.message.reply_text(
-            "⚠️ No pending signals to record.\n"
-            "Take a signal first, then use /win or /loss.",
-            parse_mode="Markdown")
+            "⚠️ No pending signals to record.", parse_mode="Markdown")
         return
 
     entry = _pop_pending(context.args)
     if entry is None:
-        sym = context.args[0].upper() if context.args else ""
         await update.message.reply_text(
-            f"⚠️ No pending signal found for `{sym}`.\n"
-            f"Use /win without arguments to record the last signal.",
-            parse_mode="Markdown")
+            "⚠️ No matching pending signal found.", parse_mode="Markdown")
         return
 
-    stats.record_result(entry["symbol"], win=True)
-    stats._save()
+    strategy = entry.get("strategy", "SMC")
+    stats.record_result(entry["symbol"], win=True, strategy=strategy)
 
     today   = stats.get_today_stats()
     wr      = stats.get_win_rate()
@@ -721,36 +733,31 @@ async def cmd_win(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(
         f"✅ *WIN RECORDED!*\n"
         f"━━━━━━━━━━━━━━━━━━━━━━\n"
-        f"💱 Pair: `{entry['symbol']}`  |  {entry.get('direction','')}\n"
+        f"💱 Pair: `{entry['symbol']}`  |  🧩 `{strategy}`\n"
         f"📍 Session: {entry.get('session','')}\n"
         f"━━━━━━━━━━━━━━━━━━━━━━\n"
         f"📊 *Overall Win Rate*: `{wr}%`\n"
         f"📅 *Today*: ✅ {today['wins']}W  ❌ {today['losses']}L\n"
         f"{streak_txt}\n"
         f"━━━━━━━━━━━━━━━━━━━━━━\n"
-        f"💪 Keep it up! Use /stats for full report.",
+        f"💪 Use /stats for the full breakdown.",
         parse_mode="Markdown")
 
 async def cmd_loss(update: Update, context: ContextTypes.DEFAULT_TYPE):
     pending = stats.data.get("pending", [])
     if not pending:
         await update.message.reply_text(
-            "⚠️ No pending signals to record.\n"
-            "Take a signal first, then use /win or /loss.",
-            parse_mode="Markdown")
+            "⚠️ No pending signals to record.", parse_mode="Markdown")
         return
 
     entry = _pop_pending(context.args)
     if entry is None:
-        sym = context.args[0].upper() if context.args else ""
         await update.message.reply_text(
-            f"⚠️ No pending signal found for `{sym}`.\n"
-            f"Use /loss without arguments to record the last signal.",
-            parse_mode="Markdown")
+            "⚠️ No matching pending signal found.", parse_mode="Markdown")
         return
 
-    stats.record_result(entry["symbol"], win=False)
-    stats._save()
+    strategy = entry.get("strategy", "SMC")
+    stats.record_result(entry["symbol"], win=False, strategy=strategy)
 
     today  = stats.get_today_stats()
     wr     = stats.get_win_rate()
@@ -758,13 +765,13 @@ async def cmd_loss(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(
         f"❌ *LOSS RECORDED*\n"
         f"━━━━━━━━━━━━━━━━━━━━━━\n"
-        f"💱 Pair: `{entry['symbol']}`  |  {entry.get('direction','')}\n"
+        f"💱 Pair: `{entry['symbol']}`  |  🧩 `{strategy}`\n"
         f"📍 Session: {entry.get('session','')}\n"
         f"━━━━━━━━━━━━━━━━━━━━━━\n"
         f"📊 *Overall Win Rate*: `{wr}%`\n"
         f"📅 *Today*: ✅ {today['wins']}W  ❌ {today['losses']}L\n"
         f"━━━━━━━━━━━━━━━━━━━━━━\n"
-        f"🧘 Stay disciplined. Use /stats for full report.",
+        f"🧘 Use /stats for the full breakdown.",
         parse_mode="Markdown")
 
 async def cmd_pause(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -790,7 +797,7 @@ async def error_handler(update: object, context: ContextTypes.DEFAULT_TYPE):
 
 
 # ──────────────────────────────────────────────────
-# MAIN — webhook mode (no polling, no 409 Conflict)
+# MAIN — webhook mode
 # ──────────────────────────────────────────────────
 def main():
     global telegram_bot
