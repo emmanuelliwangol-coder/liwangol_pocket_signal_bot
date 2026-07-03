@@ -133,26 +133,46 @@ def fetch_htf_candles(symbol: str) -> pd.DataFrame | None:
 
 # ──────────────────────────────────────────────────
 # BINANCE FETCHER (for BTCUSD — free, no API key)
+# Patched: better error logging + fallback to public data mirror
 # ──────────────────────────────────────────────────
+BINANCE_URLS = [
+    "https://data-api.binance.vision/api/v3/klines",  # public market-data mirror (tried first)
+    "https://api.binance.com/api/v3/klines",           # main API (fallback)
+]
+
 def fetch_binance_candles(symbol: str = "BTCUSDT", interval: str = "1m", limit: int = 100):
-    url = "https://api.binance.com/api/v3/klines"
-    try:
-        r = requests.get(url, params={"symbol": symbol, "interval": interval, "limit": limit}, timeout=10)
-        data = r.json()
-        if not isinstance(data, list) or len(data) == 0:
-            log.warning(f"Binance: no data for {symbol}")
-            return None
-        df = pd.DataFrame(data, columns=[
-            "OpenTime","Open","High","Low","Close","Volume",
-            "CloseTime","QAV","NT","TBBAV","TBQAV","Ignore"
-        ])
-        for col in ["Open","High","Low","Close"]:
-            df[col] = pd.to_numeric(df[col])
-        df["Datetime"] = pd.to_datetime(df["OpenTime"], unit="ms")
-        return df.reset_index(drop=True)
-    except Exception as e:
-        log.warning(f"Binance fetch error {symbol}: {e}")
-        return None
+    params = {"symbol": symbol, "interval": interval, "limit": limit}
+
+    for url in BINANCE_URLS:
+        try:
+            r = requests.get(url, params=params, timeout=10)
+
+            if r.status_code != 200:
+                log.warning(f"Binance [{url.split('/')[2]}] HTTP {r.status_code} for {symbol}: {r.text[:200]}")
+                continue
+
+            data = r.json()
+
+            if not isinstance(data, list) or len(data) == 0:
+                log.warning(f"Binance [{url.split('/')[2]}]: empty/invalid data for {symbol}: {str(data)[:200]}")
+                continue
+
+            df = pd.DataFrame(data, columns=[
+                "OpenTime","Open","High","Low","Close","Volume",
+                "CloseTime","QAV","NT","TBBAV","TBQAV","Ignore"
+            ])
+            for col in ["Open","High","Low","Close"]:
+                df[col] = pd.to_numeric(df[col])
+            df["Datetime"] = pd.to_datetime(df["OpenTime"], unit="ms")
+            log.info(f"Binance [{url.split('/')[2]}] OK — {len(df)} candles for {symbol}")
+            return df.reset_index(drop=True)
+
+        except Exception as e:
+            log.warning(f"Binance [{url.split('/')[2]}] fetch error {symbol}: {e}")
+            continue
+
+    log.error(f"Binance: ALL sources failed for {symbol} — no candle data available this cycle")
+    return None
 
 def fetch_binance_htf(symbol: str = "BTCUSDT"):
     return fetch_binance_candles(symbol, interval="1h", limit=200)
