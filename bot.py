@@ -31,6 +31,10 @@ from price_action import (
     StructureAnalyzer,
     format_structure_signal,
 )
+from mean_reversion import (
+    MeanReversionAnalyzer,
+    format_meanrev_signal,
+)
 
 # ──────────────────────────────────────────────────
 # CONFIG
@@ -582,6 +586,7 @@ analyzer          = SMCProAnalyzer()
 breakout_analyzer = LondonBreakoutAnalyzer()
 pullback_analyzer = TrendPullbackAnalyzer()
 structure_analyzer = StructureAnalyzer()
+meanrev_analyzer  = MeanReversionAnalyzer()
 telegram_bot      = None
 presignal_sent    = {}
 
@@ -678,6 +683,20 @@ async def scan_and_send(context=None):
         except Exception as e:
             log.error(f"[STRUCTURE] Error {symbol}: {e}")
 
+        # ── Mean Reversion strategy (fires only when market is ranging) ──
+        try:
+            msig = meanrev_analyzer.analyze(symbol, df, htf_bias)
+            if msig:
+                await telegram_bot.send_message(
+                    chat_id=CHAT_ID, text=format_meanrev_signal(msig), parse_mode="Markdown"
+                )
+                stats.add_signal(msig["symbol"], msig["raw_dir"], msig["price"], 0, strategy="MEANREV")
+                sent += 1
+                log.info(f"[MEANREV] Signal sent: {symbol} {msig['direction']}")
+                await asyncio.sleep(2)
+        except Exception as e:
+            log.error(f"[MEANREV] Error {symbol}: {e}")
+
     if sent == 0:
         log.info("No qualifying signals.")
 
@@ -691,7 +710,8 @@ async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         f"• 🧠 SMC PRO (15M entries, 1H HTF bias)\n"
         f"• 🇬🇧 London Breakout (session range breakout)\n"
         f"• 📈 Trend Pullback (EMA21 pullback + rejection)\n"
-        f"• 📐 Price Action / Structure (break + retest)\n\n"
+        f"• 📐 Price Action / Structure (break + retest)\n"
+        f"• 🔁 Mean Reversion (ranging markets only)\n\n"
         f"⚙️ *Settings*\n"
         f"• Min SMC Score: `{MIN_SCORE}/7`\n"
         f"• Min Confidence: `{MIN_CONFIDENCE}%`\n"
@@ -757,7 +777,7 @@ def _pop_pending(context_args: list) -> dict | None:
         return pending.pop()
 
     args = [a.upper() for a in context_args]
-    strategies = {"SMC", "BREAKOUT", "PULLBACK", "STRUCTURE"}
+    strategies = {"SMC", "BREAKOUT", "PULLBACK", "STRUCTURE", "MEANREV"}
     symbol_arg   = next((a for a in args if a not in strategies), None)
     strategy_arg = next((a for a in args if a in strategies), None)
 
