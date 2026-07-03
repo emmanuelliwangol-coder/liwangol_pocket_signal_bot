@@ -47,6 +47,8 @@ SL_BUFFER_PCT = {
 }
 TP_MOVE_MULTIPLES = [1.0, 1.5, 2.5]   # multiples of the original break-leg size
 
+MIN_CONFIDENCE = 50   # signals below this score are skipped, not sent
+
 
 # ──────────────────────────────────────────────────
 # STATE
@@ -137,6 +139,31 @@ def _find_new_swing_points(df, wing=FRACTAL_WING):
 
 
 # ──────────────────────────────────────────────────
+# CONFIDENCE SCORER
+# ──────────────────────────────────────────────────
+def _score_structure_confidence(direction, o, h, l, c, level, tol, leg_size):
+    # 1. Retest precision — how close price got to the exact level
+    #    relative to the allowed tolerance (closer = higher confidence)
+    dist = abs((l if direction == "CALL" else h) - level)
+    retest_precision = max(0, 100 - (dist / tol) * 100) if tol else 0
+
+    # 2. Rejection candle quality — wick-to-range ratio (same style as pullback)
+    total = h - l
+    if direction == "CALL":
+        wick = min(o, c) - l
+    else:
+        wick = h - max(o, c)
+    candle_quality = min(100, (wick / total) * 150) if total > 0 else 0
+
+    # 3. Level significance — bigger prior move into the level = more
+    #    traders likely watching it, so a flip is more meaningful
+    level_significance = min(100, (leg_size / level) * 4000) if level else 0
+
+    confidence = round(0.35 * candle_quality + 0.35 * retest_precision + 0.30 * level_significance)
+    return max(0, min(100, confidence))
+
+
+# ──────────────────────────────────────────────────
 # PRICE ACTION + STRUCTURE ANALYZER
 # ──────────────────────────────────────────────────
 class StructureAnalyzer:
@@ -217,6 +244,11 @@ class StructureAnalyzer:
             if leg_size == 0:
                 leg_size = abs(level) * 0.005   # fallback so TP isn't zero
 
+            confidence = _score_structure_confidence(direction, o, h, l, c, level, tol, leg_size)
+            if confidence < MIN_CONFIDENCE:
+                log.info(f"[STRUCTURE] {symbol} {direction} retest confidence {confidence}% < {MIN_CONFIDENCE}% — skip")
+                continue
+
             buf = SL_BUFFER_PCT.get(symbol, SL_BUFFER_PCT["DEFAULT"])
             if direction == "CALL":
                 sl  = round(level * (1 - buf), 5)
@@ -237,12 +269,13 @@ class StructureAnalyzer:
                 "raw_dir": direction,
                 "price": round(c, 5),
                 "level": round(level, 5),
+                "confidence": confidence,
                 "sl": sl, "tp1": tps[0], "tp2": tps[1], "tp3": tps[2],
                 "pattern": "Retest + Rejection",
                 "strategy": "STRUCTURE",
                 "session": "🧱 Break & Retest",
             }
-            log.info(f"[STRUCTURE] {symbol} {direction} fired — retest of {level}")
+            log.info(f"[STRUCTURE] {symbol} {direction} fired — confidence {confidence}%, retest of {level}")
             return result
 
         return None
@@ -253,6 +286,10 @@ class StructureAnalyzer:
 # ──────────────────────────────────────────────────
 def format_structure_signal(sig):
     now = datetime.utcnow()
+    conf = sig.get("confidence", 0)
+    conf_label = "🔥 ELITE" if conf >= 85 else "💎 HIGH" if conf >= 70 else "✅ GOOD"
+    filled = round(conf / 10)
+    bar = "🟢" * filled + "⬜" * (10 - filled)
     return (
         f"🚨 *STRUCTURE SIGNAL*\n"
         f"━━━━━━━━━━━━━━━━━━━━━━\n"
@@ -267,6 +304,9 @@ def format_structure_signal(sig):
         f"✅ *TP1*: `{sig['tp1']}`\n"
         f"✅ *TP2*: `{sig['tp2']}`\n"
         f"✅ *TP3*: `{sig['tp3']}`\n"
+        f"━━━━━━━━━━━━━━━━━━━━━━\n"
+        f"📊 *Confidence*: {conf_label}\n"
+        f"{bar} `{conf}%`\n"
         f"━━━━━━━━━━━━━━━━━━━━━━\n"
         f"🕐 `{now.strftime('%H:%M:%S UTC')}`\n"
         f"⚠️ _Risk management always applies_\n"
