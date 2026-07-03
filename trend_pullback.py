@@ -50,6 +50,8 @@ SL_BUFFER_PCT = {
 # TP measured-move multiples of the prior trend leg's size
 TP_LEG_MULTIPLES = [0.5, 1.0, 1.618]   # TP1/TP2/TP3 — 1.618 = fib extension
 
+MIN_CONFIDENCE = 50   # signals below this score are skipped, not sent
+
 
 # ──────────────────────────────────────────────────
 # STATE (per-pair cooldown tracking)
@@ -120,6 +122,30 @@ def _is_bearish_engulfing(prev, last):
 
 
 # ──────────────────────────────────────────────────
+# CONFIDENCE SCORER
+# ──────────────────────────────────────────────────
+def _score_pullback_confidence(ef, et, direction, o, h, l, c, touch_dist_pct):
+    # 1. Trend strength — how far EMA21 has separated from EMA50 (stronger trend = higher)
+    trend_sep_pct = abs(ef - et) / et if et else 0
+    trend_strength = min(100, (trend_sep_pct / 0.01) * 100)   # 1% separation ≈ full score
+
+    # 2. Rejection candle quality — wick-to-body ratio
+    body = abs(c - o)
+    total = h - l
+    if direction == "CALL":
+        wick = min(o, c) - l
+    else:
+        wick = h - max(o, c)
+    candle_quality = min(100, (wick / total) * 150) if total > 0 else 0
+
+    # 3. Touch precision — closer to the EMA (smaller touch_dist_pct) scores higher
+    touch_precision = max(0, 100 - (touch_dist_pct / TOUCH_TOLERANCE_PCT) * 100)
+
+    confidence = round(0.35 * trend_strength + 0.40 * candle_quality + 0.25 * touch_precision)
+    return max(0, min(100, confidence))
+
+
+# ──────────────────────────────────────────────────
 # TREND PULLBACK ANALYZER
 # ──────────────────────────────────────────────────
 class TrendPullbackAnalyzer:
@@ -161,6 +187,7 @@ class TrendPullbackAnalyzer:
         # ── Check for a pullback touch of EMA21 within the last few candles ──
         recent = df.tail(4)
         touched = False
+        best_touch_dist_pct = None
         for i in range(len(recent)):
             row = recent.iloc[i]
             ema_val = float(ema_fast.iloc[-(len(recent) - i)])
@@ -168,8 +195,10 @@ class TrendPullbackAnalyzer:
                        else abs(row["High"] - ema_val) / ema_val
             if htf_bias == "CALL" and row["Low"] <= ema_val * (1 + TOUCH_TOLERANCE_PCT):
                 touched = True
+                best_touch_dist_pct = dist_pct if best_touch_dist_pct is None else min(best_touch_dist_pct, dist_pct)
             if htf_bias == "PUT" and row["High"] >= ema_val * (1 - TOUCH_TOLERANCE_PCT):
                 touched = True
+                best_touch_dist_pct = dist_pct if best_touch_dist_pct is None else min(best_touch_dist_pct, dist_pct)
 
         if not touched:
             return None
@@ -187,6 +216,11 @@ class TrendPullbackAnalyzer:
             direction = "PUT"
 
         if not rejection:
+            return None
+
+        confidence = _score_pullback_confidence(ef, et, direction, o, h, l, c, best_touch_dist_pct or 0)
+        if confidence < MIN_CONFIDENCE:
+            log.info(f"[PULLBACK] {symbol} {direction} confidence {confidence}% < {MIN_CONFIDENCE}% — skip")
             return None
 
         # ── Measure the prior trend leg for TP sizing ──
@@ -217,12 +251,13 @@ class TrendPullbackAnalyzer:
             "price": round(c, 5),
             "ema_fast": round(ef, 5),
             "ema_trend": round(et, 5),
+            "confidence": confidence,
             "sl": sl, "tp1": tp1, "tp2": tp2, "tp3": tp3,
             "pattern": "Pin Bar" if (_is_bullish_pin_bar(o,h,l,c) or _is_bearish_pin_bar(o,h,l,c)) else "Engulfing",
             "strategy": "PULLBACK",
             "session": "📈 Trend Pullback",
         }
-        log.info(f"[PULLBACK] {symbol} {direction} fired — EMA21 pullback, {result['pattern']}")
+        log.info(f"[PULLBACK] {symbol} {direction} fired — confidence {confidence}%, EMA21 pullback, {result['pattern']}")
         return result
 
 
@@ -231,6 +266,10 @@ class TrendPullbackAnalyzer:
 # ──────────────────────────────────────────────────
 def format_pullback_signal(sig):
     now = datetime.utcnow()
+    conf = sig.get("confidence", 0)
+    conf_label = "🔥 ELITE" if conf >= 85 else "💎 HIGH" if conf >= 70 else "✅ GOOD"
+    filled = round(conf / 10)
+    bar = "🟢" * filled + "⬜" * (10 - filled)
     return (
         f"🚨 *TREND PULLBACK SIGNAL*\n"
         f"━━━━━━━━━━━━━━━━━━━━━━\n"
@@ -245,6 +284,9 @@ def format_pullback_signal(sig):
         f"✅ *TP1*: `{sig['tp1']}`\n"
         f"✅ *TP2*: `{sig['tp2']}`\n"
         f"✅ *TP3*: `{sig['tp3']}`\n"
+        f"━━━━━━━━━━━━━━━━━━━━━━\n"
+        f"📊 *Confidence*: {conf_label}\n"
+        f"{bar} `{conf}%`\n"
         f"━━━━━━━━━━━━━━━━━━━━━━\n"
         f"🕐 `{now.strftime('%H:%M:%S UTC')}`\n"
         f"⚠️ _Risk management always applies_\n"
