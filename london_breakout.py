@@ -59,6 +59,8 @@ SL_BUFFER_PCT = {            # SL placed just beyond the opposite range edge
 }
 TP_RANGE_MULTIPLES = [1.0, 1.5, 2.5]   # TP1/TP2/TP3 as multiples of range size
 
+MIN_CONFIDENCE = 50   # signals below this score are skipped, not sent
+
 
 # ──────────────────────────────────────────────────
 # STATE (per-pair, reset daily)
@@ -129,6 +131,35 @@ def calculate_breakout_sl_tp(entry: float, direction: str, symbol: str,
 
 
 # ──────────────────────────────────────────────────
+# CONFIDENCE SCORER
+# ──────────────────────────────────────────────────
+def _score_breakout_confidence(symbol, high, low, close, direction, last_candle):
+    mn, mx = _thresholds(symbol)
+    mid_target = (mn + mx) / 2
+    range_size = high - low
+    range_pct = _range_pct(high, low, (high + low) / 2)
+
+    # 1. Range quality — closer to the sweet-spot midpoint between min/max scores higher
+    spread = (mx - mn) / 2 or 1e-9
+    range_quality = max(0, 100 - (abs(range_pct - mid_target) / spread) * 100)
+
+    # 2. Breakout strength — how far close pushed beyond the level, relative to range size
+    if range_size <= 0:
+        breakout_strength = 0
+    else:
+        overshoot = (close - high) if direction == "CALL" else (low - close)
+        breakout_strength = min(100, max(0, (overshoot / range_size) * 200))
+
+    # 3. Candle momentum — decisive close (large body) vs indecisive doji
+    o, h, l, c = float(last_candle["Open"]), float(last_candle["High"]), float(last_candle["Low"]), float(last_candle["Close"])
+    total = h - l
+    body_ratio = (abs(c - o) / total * 100) if total > 0 else 0
+
+    confidence = round(0.35 * range_quality + 0.40 * breakout_strength + 0.25 * body_ratio)
+    return max(0, min(100, confidence))
+
+
+# ──────────────────────────────────────────────────
 # LONDON BREAKOUT ANALYZER
 # ──────────────────────────────────────────────────
 class LondonBreakoutAnalyzer:
@@ -195,6 +226,11 @@ class LondonBreakoutAnalyzer:
         if direction is None:
             return None
 
+        confidence = _score_breakout_confidence(symbol, high, low, close, direction, last)
+        if confidence < MIN_CONFIDENCE:
+            log.info(f"[BREAKOUT] {symbol} {direction} confidence {confidence}% < {MIN_CONFIDENCE}% — skip")
+            return None
+
         breakout_state.mark_fired(symbol)
 
         sl, tp1, tp2, tp3 = calculate_breakout_sl_tp(close, direction, symbol, high, low)
@@ -208,19 +244,26 @@ class LondonBreakoutAnalyzer:
             "range_high": high,
             "range_low": low,
             "range_pct": range_pips_pct,
+            "confidence": confidence,
             "sl": sl, "tp1": tp1, "tp2": tp2, "tp3": tp3,
             "strategy": "BREAKOUT",
             "session": "🇬🇧 London Breakout",
         }
-        log.info(f"[BREAKOUT] {symbol} {direction} fired — range {low}-{high}, close {close}")
+        log.info(f"[BREAKOUT] {symbol} {direction} fired — confidence {confidence}%, range {low}-{high}, close {close}")
         return result
 
 
 # ──────────────────────────────────────────────────
 # FORMATTER (matches the visual style of your SMC signals)
 # ──────────────────────────────────────────────────
+def confidence_bar(pct: int) -> str:
+    filled = round(pct / 10)
+    return "🟢" * filled + "⬜" * (10 - filled)
+
 def format_breakout_signal(sig):
     now = datetime.utcnow()
+    conf = sig.get("confidence", 0)
+    conf_label = "🔥 ELITE" if conf >= 85 else "💎 HIGH" if conf >= 70 else "✅ GOOD"
     return (
         f"🚨 *LONDON BREAKOUT SIGNAL*\n"
         f"━━━━━━━━━━━━━━━━━━━━━━\n"
@@ -235,6 +278,9 @@ def format_breakout_signal(sig):
         f"✅ *TP1*: `{sig['tp1']}`\n"
         f"✅ *TP2*: `{sig['tp2']}`\n"
         f"✅ *TP3*: `{sig['tp3']}`\n"
+        f"━━━━━━━━━━━━━━━━━━━━━━\n"
+        f"📊 *Confidence*: {conf_label}\n"
+        f"{confidence_bar(conf)} `{conf}%`\n"
         f"━━━━━━━━━━━━━━━━━━━━━━\n"
         f"🕐 `{now.strftime('%H:%M:%S UTC')}`\n"
         f"⚠️ _Risk management always applies_\n"
