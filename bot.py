@@ -237,7 +237,7 @@ class StatsManager:
         with open(STATS_FILE,"w") as f:
             json.dump(self.data, f, indent=2, default=str)
 
-    def add_signal(self, symbol, direction, price, score, strategy="SMC"):
+    def add_signal(self, symbol, direction, price, score, strategy="SMC", sl=None, tp1=None):
         trade_id = f"T{self.data.get('next_id', 1)}"
         self.data["next_id"] = self.data.get("next_id", 1) + 1
         self.data["pending"].append({
@@ -245,6 +245,7 @@ class StatsManager:
             "symbol": symbol, "direction": direction,
             "entry_price": price, "score": score,
             "strategy": strategy,
+            "sl": sl, "tp1": tp1,
             "session": session_name(symbol),
             "entry_time": datetime.utcnow().isoformat(),
             "expiry_time": (datetime.utcnow()+timedelta(minutes=EXPIRY_MIN)).isoformat(),
@@ -599,6 +600,147 @@ telegram_bot      = None
 presignal_sent    = {}
 
 # ──────────────────────────────────────────────────
+# AUTO-OUTCOME DETECTION
+# ──────────────────────────────────────────────────
+AUTO_EXPIRE_HOURS = 48   # pending trades older than this auto-expire, uncounted
+
+async def check_auto_outcomes(symbol: str, df):
+    """
+    Checks every pending trade on this symbol against the candle data
+    already fetched this cycle (no extra API calls). If price touched
+    TP1 or SL since the trade's entry_time, auto-records the result and
+    notifies in Telegram — so trades get logged even if the person is
+    offline, busy, or simply misses the signal.
+
+    Limitation: this works off 15-min candle highs/lows, not tick data.
+    If BOTH SL and TP1 fall inside the same candle's range, there's no
+    way to know which was actually touched first — in that case this
+    defaults to LOSS, the conservative assumption, rather than guessing
+    a win it can't actually verify.
+    """
+    if df is None or "Datetime" not in df.columns or telegram_bot is None:
+        return
+
+    pending = stats.data.get("pending", [])
+    if not pending:
+        return
+
+    now = datetime.utcnow()
+    still_pending = []
+    resolved_this_run = []
+
+    for entry in pending:
+        if entry["symbol"] != symbol:
+            still_pending.append(entry)
+            continue
+
+        sl = entry.get("sl")
+        tp1 = entry.get("tp1")
+        if sl is None or tp1 is None:
+            # Can't auto-check without stored SL/TP (shouldn't happen for
+            # new signals, but keep old pending entries safe).
+            still_pending.append(entry)
+            continue
+
+        try:
+            entry_time = datetime.fromisoformat(entry["entry_time"])
+        except Exception:
+            still_pending.append(entry)
+            continue
+
+        # Auto-expire stale pending trades without counting them
+        if (now - entry_time) > timedelta(hours=AUTO_EXPIRE_HOURS):
+            log.info(f"[AUTO-CHECK] {entry['id']} ({symbol}) expired after {AUTO_EXPIRE_HOURS}h unresolved — dropped, not counted")
+            continue
+
+        direction = entry["direction"]   # "CALL" or "PUT"
+        future = df[df["Datetime"] > entry_time]
+        if future.empty:
+            still_pending.append(entry)
+            continue
+
+        outcome = None
+        for _, row in future.iterrows():
+            hi, lo = float(row["High"]), float(row["Low"])
+            if direction == "CALL":
+                hit_tp = hi >= tp1
+                hit_sl = lo <= sl
+            else:
+                hit_tp = lo <= tp1
+                hit_sl = hi >= sl
+
+            if hit_sl and hit_tp:
+                outcome = "loss"   # ambiguous same-candle touch — conservative default
+                break
+            elif hit_sl:
+                outcome = "loss"
+                break
+            elif hit_tp:
+                outcome = "win"
+                break
+
+        if outcome is None:
+            still_pending.append(entry)
+            continue
+
+        # Resolved — record it
+        strategy = entry.get("strategy", "SMC")
+        stats.record_result(entry["symbol"], win=(outcome == "win"), strategy=strategy)
+        resolved_this_run.append((entry, outcome))
+
+    stats.data["pending"] = still_pending
+    stats._save()
+
+    # Notify in Telegram for each auto-resolved trade
+    for entry, outcome in resolved_this_run:
+        emoji = "✅" if outcome == "win" else "❌"
+        label = "WIN" if outcome == "win" else "LOSS"
+        try:
+            await telegram_bot.send_message(
+                chat_id=CHAT_ID,
+                text=(
+                    f"🤖 *Auto-Detected Result*\n"
+                    f"━━━━━━━━━━━━━━━━━━━━━━\n"
+                    f"🆔 Trade: `{entry['id']}`\n"
+                    f"💱 Pair: `{entry['symbol']}`  |  🧩 `{entry.get('strategy','SMC')}`\n"
+                    f"{emoji} Result: *{label}*\n"
+                    f"━━━━━━━━━━━━━━━━━━━━━━\n"
+                    f"📊 *Overall Win Rate*: `{stats.get_win_rate()}%`\n"
+                    f"_Detected from market data — no action needed._"
+                ),
+                parse_mode="Markdown"
+            )
+            log.info(f"[AUTO-CHECK] {entry['id']} ({entry['symbol']}) auto-recorded as {label}")
+        except Exception as e:
+            log.error(f"[AUTO-CHECK] Notify error for {entry['id']}: {e}")
+
+
+# ──────────────────────────────────────────────────
+# CROSS-STRATEGY CONFLUENCE
+# ──────────────────────────────────────────────────
+def build_confluence_note(fired: list) -> str:
+    """
+    Given every strategy that fired on the SAME pair in the SAME scan
+    cycle, detect whether they agree or conflict.
+      - 2+ strategies, same direction  -> confluence (stronger signal)
+      - 2+ strategies, different directions -> conflict warning
+      - 0 or 1 strategy fired -> no note needed
+    """
+    if len(fired) < 2:
+        return ""
+
+    directions = {f["raw_dir"] for f in fired}
+    names = [f["strategy"] for f in fired]
+
+    if len(directions) == 1:
+        direction = directions.pop()
+        return f"🤝 *Confluence*: {' + '.join(names)} all agree (`{direction}`) — {len(fired)} strategies"
+    else:
+        detail = ", ".join(f"{f['strategy']}:`{f['raw_dir']}`" for f in fired)
+        return f"⚠️ *Conflicting signals this cycle*: {detail}"
+
+
+# ──────────────────────────────────────────────────
 # SCANNER  (now runs SMC + Breakout off the same fetched candles)
 # ──────────────────────────────────────────────────
 async def scan_and_send(context=None):
@@ -627,26 +769,36 @@ async def scan_and_send(context=None):
         else:
             df = fetch_candles(td_symbol, interval="15min", outputsize=100)
 
+        # Check pending trades on this pair against the SAME candle data
+        # we just fetched — resolves wins/losses automatically from the
+        # market itself, no extra API cost, no manual /win or /loss needed.
+        try:
+            await check_auto_outcomes(symbol, df)
+        except Exception as e:
+            log.error(f"[AUTO-CHECK] Error {symbol}: {e}")
+
         # Fetch HTF bias ONCE per symbol per scan cycle and share it —
         # previously this was fetched twice (once inside SMC's analyze(),
         # once again for Pullback/MeanReversion), doubling API usage.
         htf_bias = analyzer.get_htf_bias(td_symbol, symbol)
 
-        # ── SMC strategy ──
+        # ── Evaluate all 5 strategies BEFORE sending anything. This is
+        # what makes confluence detection possible — we need to know
+        # what every strategy found on this pair THIS cycle before any
+        # message goes out, so agreement/conflict can be flagged. ──
+        fired = []   # list of dicts: strategy, raw_dir, body text, add_signal args
+
+        # SMC
         sig, sig_type = analyzer.analyze(symbol, td_symbol, df=df, htf_bias=htf_bias)
         if sig and sig_type == "signal":
-            try:
-                trade_id = stats.add_signal(sig["symbol"], sig["raw_dir"], sig["price"], sig["score"], strategy="SMC")
-                text = format_signal(sig) + f"\n🆔 *Trade ID*: `{trade_id}`"
-                await telegram_bot.send_message(
-                    chat_id=CHAT_ID, text=text, parse_mode="Markdown"
-                )
-                presignal_sent.pop(symbol, None)
-                sent += 1
-                log.info(f"[SMC] Signal sent: {symbol} {sig['direction']} score={sig['score']} id={trade_id}")
-                await asyncio.sleep(2)
-            except Exception as e:
-                log.error(f"[SMC] Send error {symbol}: {e}")
+            smc_sl, smc_tp1, _, _ = calculate_sl_tp(sig["price"], sig["raw_dir"], sig["symbol"])
+            fired.append({
+                "strategy": "SMC",
+                "raw_dir": sig["raw_dir"],
+                "body": format_signal(sig),
+                "add_args": (sig["symbol"], sig["raw_dir"], sig["price"], sig["score"], "SMC", smc_sl, smc_tp1),
+            })
+            presignal_sent.pop(symbol, None)
         elif sig and sig_type == "presignal":
             last_conf = presignal_sent.get(symbol, 0)
             if sig["confidence"] >= last_conf + 5:
@@ -665,66 +817,79 @@ async def scan_and_send(context=None):
         else:
             presignal_sent.pop(symbol, None)
 
-
-        # ── London Breakout strategy ──
+        # Breakout
         try:
             bsig = breakout_analyzer.analyze(symbol, df)
             if bsig:
-                trade_id = stats.add_signal(bsig["symbol"], bsig["raw_dir"], bsig["price"], bsig.get("confidence", 0), strategy="BREAKOUT")
-                text = format_breakout_signal(bsig) + f"\n🆔 *Trade ID*: `{trade_id}`"
-                await telegram_bot.send_message(
-                    chat_id=CHAT_ID, text=text, parse_mode="Markdown"
-                )
-                sent += 1
-                log.info(f"[BREAKOUT] Signal sent: {symbol} {bsig['direction']} id={trade_id}")
-                await asyncio.sleep(2)
+                fired.append({
+                    "strategy": "BREAKOUT",
+                    "raw_dir": bsig["raw_dir"],
+                    "body": format_breakout_signal(bsig),
+                    "add_args": (bsig["symbol"], bsig["raw_dir"], bsig["price"], bsig.get("confidence", 0), "BREAKOUT", bsig.get("sl"), bsig.get("tp1")),
+                })
         except Exception as e:
             log.error(f"[BREAKOUT] Error {symbol}: {e}")
 
-        # ── Trend Pullback strategy (reuses htf_bias fetched above — no extra API call) ──
+        # Pullback (reuses htf_bias fetched above — no extra API call)
         try:
             psig = pullback_analyzer.analyze(symbol, df, htf_bias)
             if psig:
-                trade_id = stats.add_signal(psig["symbol"], psig["raw_dir"], psig["price"], psig.get("confidence", 0), strategy="PULLBACK")
-                text = format_pullback_signal(psig) + f"\n🆔 *Trade ID*: `{trade_id}`"
-                await telegram_bot.send_message(
-                    chat_id=CHAT_ID, text=text, parse_mode="Markdown"
-                )
-                sent += 1
-                log.info(f"[PULLBACK] Signal sent: {symbol} {psig['direction']} id={trade_id}")
-                await asyncio.sleep(2)
+                fired.append({
+                    "strategy": "PULLBACK",
+                    "raw_dir": psig["raw_dir"],
+                    "body": format_pullback_signal(psig),
+                    "add_args": (psig["symbol"], psig["raw_dir"], psig["price"], psig.get("confidence", 0), "PULLBACK", psig.get("sl"), psig.get("tp1")),
+                })
         except Exception as e:
             log.error(f"[PULLBACK] Error {symbol}: {e}")
 
-        # ── Price Action + Structure strategy ──
+        # Structure
         try:
             ssig = structure_analyzer.analyze(symbol, df)
             if ssig:
-                trade_id = stats.add_signal(ssig["symbol"], ssig["raw_dir"], ssig["price"], ssig.get("confidence", 0), strategy="STRUCTURE")
-                text = format_structure_signal(ssig) + f"\n🆔 *Trade ID*: `{trade_id}`"
-                await telegram_bot.send_message(
-                    chat_id=CHAT_ID, text=text, parse_mode="Markdown"
-                )
-                sent += 1
-                log.info(f"[STRUCTURE] Signal sent: {symbol} {ssig['direction']} id={trade_id}")
-                await asyncio.sleep(2)
+                fired.append({
+                    "strategy": "STRUCTURE",
+                    "raw_dir": ssig["raw_dir"],
+                    "body": format_structure_signal(ssig),
+                    "add_args": (ssig["symbol"], ssig["raw_dir"], ssig["price"], ssig.get("confidence", 0), "STRUCTURE", ssig.get("sl"), ssig.get("tp1")),
+                })
         except Exception as e:
             log.error(f"[STRUCTURE] Error {symbol}: {e}")
 
-        # ── Mean Reversion strategy (fires only when market is ranging, reuses same htf_bias) ──
+        # Mean Reversion (fires only when market is ranging, reuses same htf_bias)
         try:
             msig = meanrev_analyzer.analyze(symbol, df, htf_bias)
             if msig:
-                trade_id = stats.add_signal(msig["symbol"], msig["raw_dir"], msig["price"], msig.get("confidence", 0), strategy="MEANREV")
-                text = format_meanrev_signal(msig) + f"\n🆔 *Trade ID*: `{trade_id}`"
+                fired.append({
+                    "strategy": "MEANREV",
+                    "raw_dir": msig["raw_dir"],
+                    "body": format_meanrev_signal(msig),
+                    "add_args": (msig["symbol"], msig["raw_dir"], msig["price"], msig.get("confidence", 0), "MEANREV", msig.get("sl"), msig.get("tp1")),
+                })
+        except Exception as e:
+            log.error(f"[MEANREV] Error {symbol}: {e}")
+
+        # ── Confluence check across everything that fired on this pair ──
+        confluence_note = build_confluence_note(fired)
+        if confluence_note:
+            log.info(f"[CONFLUENCE] {symbol}: {confluence_note}")
+
+        # ── Send each fired signal, annotated with the confluence note ──
+        for f in fired:
+            try:
+                trade_id = stats.add_signal(*f["add_args"])
+                text = f["body"]
+                if confluence_note:
+                    text += f"\n{confluence_note}"
+                text += f"\n🆔 *Trade ID*: `{trade_id}`"
                 await telegram_bot.send_message(
                     chat_id=CHAT_ID, text=text, parse_mode="Markdown"
                 )
                 sent += 1
-                log.info(f"[MEANREV] Signal sent: {symbol} {msig['direction']} id={trade_id}")
+                log.info(f"[{f['strategy']}] Signal sent: {symbol} {f['raw_dir']} id={trade_id}")
                 await asyncio.sleep(2)
-        except Exception as e:
-            log.error(f"[MEANREV] Error {symbol}: {e}")
+            except Exception as e:
+                log.error(f"[{f['strategy']}] Send error {symbol}: {e}")
 
     if sent == 0:
         log.info("No qualifying signals.")
@@ -757,7 +922,11 @@ async def cmd_help(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "/pairs — Active pairs\n"
         "/session — Session status\n"
         "/scan — Force immediate scan\n\n"
-        "📝 *After each trade:*\n"
+        "🤖 *Auto-tracking:* every trade's result is now detected "
+        "automatically from market candles — if price hits TP1 or SL, "
+        "you'll get a result notification even if you never reply. "
+        "Manual recording below still works as a backup.\n\n"
+        "📝 *Manual recording (optional backup):*\n"
         "/win T7 — Record a SPECIFIC trade as WIN (recommended)\n"
         "/loss T7 — Record a SPECIFIC trade as LOSS (recommended)\n"
         "/win — Record most recent signal as WIN\n"
