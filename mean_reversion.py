@@ -54,6 +54,13 @@ SL_BUFFER_PCT = {
 # TP as fraction of the distance from entry back to the mean (mid band)
 TP_MEAN_FRACTIONS = [0.6, 1.0, 1.4]   # TP1 = 60% of the way to the mean, TP3 overshoots slightly
 
+# Caps how far SL can sit from ENTRY, as a fraction of the distance back
+# to the mean. Precautionary — MeanRev's SL is already reasonably bounded
+# since entry (the close) and the band extreme are on the same candle,
+# but this guarantees TP1 can never pay out less than it risks even on
+# an unusually large wick.
+MAX_SL_MEAN_FRACTION = 0.6
+
 MIN_CONFIDENCE = 50   # signals below this score are skipped, not sent
 
 
@@ -211,12 +218,17 @@ class MeanReversionAnalyzer:
 
         buf = SL_BUFFER_PCT.get(symbol, SL_BUFFER_PCT["DEFAULT"])
         dist_to_mean = abs(m - c)
+        max_sl_distance = dist_to_mean * MAX_SL_MEAN_FRACTION
 
         if direction == "CALL":
-            sl  = round(lo * (1 - buf), 5)
+            natural_sl = lo * (1 - buf)
+            capped_sl  = c - max_sl_distance
+            sl = round(max(natural_sl, capped_sl), 5)
             tps = [round(c + dist_to_mean * f, 5) for f in TP_MEAN_FRACTIONS]
         else:
-            sl  = round(u * (1 + buf), 5)
+            natural_sl = u * (1 + buf)
+            capped_sl  = c + max_sl_distance
+            sl = round(min(natural_sl, capped_sl), 5)
             tps = [round(c - dist_to_mean * f, 5) for f in TP_MEAN_FRACTIONS]
 
         meanrev_state.mark_fired(symbol)
