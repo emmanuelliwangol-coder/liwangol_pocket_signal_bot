@@ -50,6 +50,14 @@ SL_BUFFER_PCT = {
 # TP measured-move multiples of the prior trend leg's size
 TP_LEG_MULTIPLES = [0.5, 1.0, 1.618]   # TP1/TP2/TP3 — 1.618 = fib extension
 
+# Caps how far SL can sit from ENTRY, in multiples of leg_size. Without
+# this, SL is anchored to the raw swing low/high of the last 6 candles —
+# a value with no relationship to leg_size (which drives TP). If a wick
+# a few candles back sits far from the current entry, SL balloons while
+# TP stays fixed, producing the same broken risk profile Breakout had.
+# Set to match TP1's multiple (0.5) so worst-case R:R at TP1 is ~1:1.
+MAX_SL_LEG_MULTIPLE = 0.5
+
 MIN_CONFIDENCE = 50   # signals below this score are skipped, not sent
 
 
@@ -80,12 +88,19 @@ def calculate_pullback_sl_tp(entry: float, direction: str, symbol: str,
                               swing_low: float, swing_high: float,
                               leg_size: float):
     buf = SL_BUFFER_PCT.get(symbol, SL_BUFFER_PCT["DEFAULT"])
+    max_sl_distance = leg_size * MAX_SL_LEG_MULTIPLE
 
     if direction == "CALL":
-        sl = round(swing_low * (1 - buf), 5)
+        natural_sl = swing_low * (1 - buf)      # raw swing extreme
+        capped_sl  = entry - max_sl_distance      # bounded risk from entry
+        # Use whichever is CLOSER to entry — the raw swing low if it's
+        # already tight, or the cap if the swing low is too far away.
+        sl = round(max(natural_sl, capped_sl), 5)
         tps = [round(entry + leg_size * m, 5) for m in TP_LEG_MULTIPLES]
     else:
-        sl = round(swing_high * (1 + buf), 5)
+        natural_sl = swing_high * (1 + buf)
+        capped_sl  = entry + max_sl_distance
+        sl = round(min(natural_sl, capped_sl), 5)
         tps = [round(entry - leg_size * m, 5) for m in TP_LEG_MULTIPLES]
 
     return sl, tps[0], tps[1], tps[2]
