@@ -59,6 +59,15 @@ SL_BUFFER_PCT = {            # SL placed just beyond the opposite range edge
 }
 TP_RANGE_MULTIPLES = [1.0, 1.5, 2.5]   # TP1/TP2/TP3 as multiples of range size
 
+# Caps how far SL can sit from ENTRY, in multiples of range size. Without
+# this, a strong breakout candle that already ran hard before closing
+# would place SL at the opposite range edge — inheriting both the range
+# width AND the extra distance already traveled, producing a much larger
+# risk than any of the TPs reward. Capping SL keeps risk bounded to a
+# sane, fixed multiple of the range regardless of how far price already
+# moved before the signal fired.
+MAX_SL_RANGE_MULTIPLE = 1.0
+
 MIN_CONFIDENCE = 50   # signals below this score are skipped, not sent
 
 
@@ -119,12 +128,20 @@ def calculate_breakout_sl_tp(entry: float, direction: str, symbol: str,
                               range_high: float, range_low: float):
     buf = SL_BUFFER_PCT.get(symbol, SL_BUFFER_PCT["DEFAULT"])
     range_size = range_high - range_low
+    max_sl_distance = range_size * MAX_SL_RANGE_MULTIPLE
 
     if direction == "CALL":
-        sl = round(range_low * (1 - buf), 5)
+        natural_sl = range_low * (1 - buf)          # full range reclaim = invalidated
+        capped_sl  = entry - max_sl_distance          # bounded risk from entry
+        # Use whichever SL is CLOSER to entry — this is what actually
+        # bounds the risk. If the breakout candle already ran far, the
+        # "natural" range-edge SL would be too distant, so the cap wins.
+        sl = round(max(natural_sl, capped_sl), 5)
         tps = [round(entry + range_size * m, 5) for m in TP_RANGE_MULTIPLES]
     else:
-        sl = round(range_high * (1 + buf), 5)
+        natural_sl = range_high * (1 + buf)
+        capped_sl  = entry + max_sl_distance
+        sl = round(min(natural_sl, capped_sl), 5)
         tps = [round(entry - range_size * m, 5) for m in TP_RANGE_MULTIPLES]
 
     return sl, tps[0], tps[1], tps[2]
