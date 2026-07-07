@@ -122,6 +122,14 @@ def fetch_candles(symbol: str, interval="1min", outputsize=100) -> pd.DataFrame 
         "outputsize": outputsize,
         "apikey":     TD_API_KEY,
         "format":     "JSON",
+        "timezone":   "UTC",   # CRITICAL: without this, Twelve Data returns
+                                # timestamps in the exchange's LOCAL timezone,
+                                # not UTC. Since entry_time is stored via
+                                # datetime.utcnow(), comparing an unconverted
+                                # local timestamp against it can silently
+                                # misjudge which candles are actually "after"
+                                # a signal fired — causing auto-outcome checks
+                                # to fire on the wrong candles.
     }
     try:
         r = requests.get(url, params=params, timeout=10)
@@ -706,23 +714,29 @@ async def check_auto_outcomes(symbol: str, df):
             still_pending.append(entry)
             continue
 
-        sl = entry.get("sl")
-        tp1 = entry.get("tp1")
-        if sl is None or tp1 is None:
-            # Can't auto-check without stored SL/TP (shouldn't happen for
-            # new signals, but keep old pending entries safe).
-            still_pending.append(entry)
-            continue
-
         try:
             entry_time = datetime.fromisoformat(entry["entry_time"])
         except Exception:
+            # Can't parse entry_time — keep it pending rather than risk
+            # silently dropping something we can't safely evaluate.
             still_pending.append(entry)
             continue
 
-        # Auto-expire stale pending trades without counting them
+        # Auto-expire stale pending trades WITHOUT counting them — this
+        # runs for EVERY pending entry regardless of whether it has
+        # stored SL/TP, so nothing can sit in /pending forever just
+        # because it's missing that data (e.g. older entries from
+        # before SL/TP storage was added).
         if (now - entry_time) > timedelta(hours=AUTO_EXPIRE_HOURS):
             log.info(f"[AUTO-CHECK] {entry['id']} ({symbol}) expired after {AUTO_EXPIRE_HOURS}h unresolved — dropped, not counted")
+            continue
+
+        sl = entry.get("sl")
+        tp1 = entry.get("tp1")
+        if sl is None or tp1 is None:
+            # Not old enough to expire, but can't auto-check without
+            # stored SL/TP — leave it pending for manual /win or /loss.
+            still_pending.append(entry)
             continue
 
         direction = entry["direction"]   # "CALL" or "PUT"
