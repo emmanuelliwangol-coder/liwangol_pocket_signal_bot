@@ -50,6 +50,12 @@ PRE_SIGNAL_MIN  = 45
 MAX_SCORE       = 7
 STATS_FILE      = "stats.json"
 
+# Circuit breaker: after this many CONSECUTIVE losses on a single
+# strategy, that strategy auto-pauses for the cooldown period below.
+# A win resets the streak to 0 and clears any active pause immediately.
+CIRCUIT_BREAKER_LOSS_STREAK = 3
+CIRCUIT_BREAKER_COOLDOWN_HOURS = 4
+
 WEBHOOK_URL  = os.getenv("WEBHOOK_URL", "")
 WEBHOOK_PORT = int(os.getenv("PORT", "8080"))
 
@@ -192,30 +198,47 @@ def fetch_binance_htf(symbol: str = "BTCUSDT"):
 # ──────────────────────────────────────────────────
 # SL / TP CALCULATOR (SMC strategy)
 # ──────────────────────────────────────────────────
-def calculate_sl_tp(entry: float, direction: str, symbol: str):
-    if symbol == "XAUUSD":
-        sl_pct  = 0.0012
-        tp_pcts = [0.0018, 0.0024, 0.0036]
-    elif symbol == "BTCUSD":
-        sl_pct  = 0.0040
-        tp_pcts = [0.0060, 0.0080, 0.0120]
-    elif symbol in ("USDJPY",):
-        sl_pct  = 0.0020
-        tp_pcts = [0.0030, 0.0040, 0.0060]
+ATR_SL_MULTIPLIER = 1.0            # SL = 1.0x ATR from entry
+ATR_TP_MULTIPLIERS = [1.5, 2.0, 3.0]  # TP1/TP2/TP3 — same ratio as the old fixed-% method (1.5x/2x/3x of SL)
+
+# Consecutive-loss circuit breaker — per strategy, not global. If a
+def calculate_sl_tp(entry: float, direction: str, symbol: str, atr: float = None):
+    """
+    Uses ATR (Average True Range) to size SL/TP to the CURRENT day's
+    actual volatility, instead of a static percentage that's too wide
+    on calm days and too tight on volatile ones. Falls back to the
+    original fixed-percentage method if ATR isn't available (e.g. not
+    enough candle history, or a caller that doesn't pass it).
+    """
+    if atr and atr > 0:
+        sl_dist = atr * ATR_SL_MULTIPLIER
+        tp_dists = [atr * m for m in ATR_TP_MULTIPLIERS]
     else:
-        sl_pct  = 0.0020
-        tp_pcts = [0.0030, 0.0040, 0.0060]
+        if symbol == "XAUUSD":
+            sl_pct  = 0.0012
+            tp_pcts = [0.0018, 0.0024, 0.0036]
+        elif symbol == "BTCUSD":
+            sl_pct  = 0.0040
+            tp_pcts = [0.0060, 0.0080, 0.0120]
+        elif symbol in ("USDJPY",):
+            sl_pct  = 0.0020
+            tp_pcts = [0.0030, 0.0040, 0.0060]
+        else:
+            sl_pct  = 0.0020
+            tp_pcts = [0.0030, 0.0040, 0.0060]
+        sl_dist = entry * sl_pct
+        tp_dists = [entry * p for p in tp_pcts]
 
     if direction == "CALL":
-        sl  = round(entry * (1 - sl_pct), 5)
-        tp1 = round(entry * (1 + tp_pcts[0]), 5)
-        tp2 = round(entry * (1 + tp_pcts[1]), 5)
-        tp3 = round(entry * (1 + tp_pcts[2]), 5)
+        sl  = round(entry - sl_dist, 5)
+        tp1 = round(entry + tp_dists[0], 5)
+        tp2 = round(entry + tp_dists[1], 5)
+        tp3 = round(entry + tp_dists[2], 5)
     else:
-        sl  = round(entry * (1 + sl_pct), 5)
-        tp1 = round(entry * (1 - tp_pcts[0]), 5)
-        tp2 = round(entry * (1 - tp_pcts[1]), 5)
-        tp3 = round(entry * (1 - tp_pcts[2]), 5)
+        sl  = round(entry + sl_dist, 5)
+        tp1 = round(entry - tp_dists[0], 5)
+        tp2 = round(entry - tp_dists[1], 5)
+        tp3 = round(entry - tp_dists[2], 5)
     return sl, tp1, tp2, tp3
 
 # ──────────────────────────────────────────────────
@@ -269,9 +292,44 @@ class StatsManager:
         self.data["daily"].setdefault(today, {"wins":0,"losses":0})
         self.data["daily"][today]["wins" if win else "losses"] += 1
         self.data.setdefault("strategies", {})
-        self.data["strategies"].setdefault(strategy, {"wins":0,"losses":0})
+        self.data["strategies"].setdefault(strategy, {"wins":0,"losses":0,"loss_streak":0,"paused_until":None})
         self.data["strategies"][strategy]["wins" if win else "losses"] += 1
+
+        # ── Circuit breaker: track consecutive losses PER STRATEGY ──
+        strat_data = self.data["strategies"][strategy]
+        just_triggered = False
+        if win:
+            strat_data["loss_streak"] = 0
+        else:
+            strat_data["loss_streak"] = strat_data.get("loss_streak", 0) + 1
+            if strat_data["loss_streak"] >= CIRCUIT_BREAKER_LOSS_STREAK and not strat_data.get("paused_until"):
+                pause_until = datetime.utcnow() + timedelta(hours=CIRCUIT_BREAKER_COOLDOWN_HOURS)
+                strat_data["paused_until"] = pause_until.isoformat()
+                strat_data["loss_streak"] = 0   # reset so it needs a fresh streak to re-trigger after resuming
+                just_triggered = True
+
         self._save()
+        return just_triggered
+
+    def is_strategy_paused(self, strategy: str) -> tuple:
+        """
+        Returns (is_paused, just_resumed). just_resumed is True only on
+        the exact check where the cooldown has JUST expired, so the
+        caller can send a one-time "circuit breaker lifted" notification
+        instead of silently going quiet or spamming every cycle.
+        """
+        strat_data = self.data.get("strategies", {}).get(strategy)
+        if not strat_data or not strat_data.get("paused_until"):
+            return False, False
+
+        paused_until = datetime.fromisoformat(strat_data["paused_until"])
+        if datetime.utcnow() < paused_until:
+            return True, False
+
+        # Cooldown expired — auto-resume
+        strat_data["paused_until"] = None
+        self._save()
+        return False, True
 
     def get_win_rate(self):
         if self.data["total"] == 0: return 0.0
@@ -307,7 +365,17 @@ class StatsManager:
             tot = rec["wins"]+rec["losses"]
             rate = round(rec["wins"]/tot*100,1) if tot else 0
             bar = "🟩" if rate>=60 else "🟨" if rate>=50 else "🟥"
-            sb += f"  {bar} `{strat}`: {rec['wins']}W/{rec['losses']}L ({rate}%)\n"
+            paused_until = rec.get("paused_until")
+            pause_note = ""
+            if paused_until:
+                try:
+                    until_dt = datetime.fromisoformat(paused_until)
+                    if datetime.utcnow() < until_dt:
+                        hrs_left = round((until_dt - datetime.utcnow()).total_seconds() / 3600, 1)
+                        pause_note = f" ⏸ _paused ~{hrs_left}h left_"
+                except Exception:
+                    pass
+            sb += f"  {bar} `{strat}`: {rec['wins']}W/{rec['losses']}L ({rate}%){pause_note}\n"
 
         return (
             f"📊 *BOT PERFORMANCE — MULTI-STRATEGY*\n"
@@ -397,6 +465,7 @@ class SMCProAnalyzer:
         rsi    = ta.momentum.RSIIndicator(close, window=14).rsi()
         macd_o = ta.trend.MACD(close)
         bb     = ta.volatility.BollingerBands(close, window=20, window_dev=2)
+        atr_ind = ta.volatility.AverageTrueRange(df["High"], df["Low"], close, window=14)
 
         e8,e21,e50 = float(ema8.iloc[-1]),float(ema21.iloc[-1]),float(ema50.iloc[-1])
         pe8,pe21   = float(ema8.iloc[-2]),float(ema21.iloc[-2])
@@ -406,6 +475,7 @@ class SMCProAnalyzer:
         lc         = float(close.iloc[-1])
         bbh        = float(bb.bollinger_hband().iloc[-1])
         bbl        = float(bb.bollinger_lband().iloc[-1])
+        atr_v      = float(atr_ind.average_true_range().iloc[-1])
 
         bull_cross = (pe8 < pe21) and (e8 > e21)
         bear_cross = (pe8 > pe21) and (e8 < e21)
@@ -421,6 +491,7 @@ class SMCProAnalyzer:
             "rsi": round(rsi_v,1), "price": lc,
             "bull_rsi": rsi_v>50,  "bear_rsi": rsi_v<50,
             "bull_bb":  lc<=bbl,   "bear_bb":  lc>=bbh,
+            "atr": atr_v,
         }
 
     def analyze(self, symbol, td_symbol, df=None, htf_bias="__unset__"):
@@ -494,7 +565,7 @@ class SMCProAnalyzer:
                   "price":round(meta["price"],5),"rsi":meta["rsi"],
                   "score":score,"strength":strength,"smc_tags":active,
                   "pending_tags":pending,
-                  "confidence":confidence,
+                  "confidence":confidence,"atr":meta.get("atr"),
                   "session":session_name(symbol),"htf_bias":htf or "Neutral"}
 
         if confidence >= MIN_CONFIDENCE:
@@ -522,7 +593,7 @@ def format_signal(sig):
     stars  = "⭐"*sig["score"]
     entry  = sig["price"]
     conf   = sig["confidence"]
-    sl,tp1,tp2,tp3 = calculate_sl_tp(entry, sig["raw_dir"], sig["symbol"])
+    sl,tp1,tp2,tp3 = calculate_sl_tp(entry, sig["raw_dir"], sig["symbol"], atr=sig.get("atr"))
 
     if conf >= 90:
         conf_label = "🔥 ELITE"
@@ -538,6 +609,7 @@ def format_signal(sig):
         f"🎯 Direction: *{sig['direction']}*\n"
         f"📍 Session: {sig['session']}\n"
         f"📈 HTF Bias: `{sig['htf_bias']}`\n"
+        f"📏 ATR(14): `{round(sig.get('atr', 0), 5) if sig.get('atr') else 'N/A'}`\n"
         f"━━━━━━━━━━━━━━━━━━━━━━\n"
         f"🎯 *Entry*: `{entry}`\n"
         f"⛔ *Stop Loss*: `{sl}`\n"
@@ -685,14 +757,14 @@ async def check_auto_outcomes(symbol: str, df):
 
         # Resolved — record it
         strategy = entry.get("strategy", "SMC")
-        stats.record_result(entry["symbol"], win=(outcome == "win"), strategy=strategy)
-        resolved_this_run.append((entry, outcome))
+        breaker_triggered = stats.record_result(entry["symbol"], win=(outcome == "win"), strategy=strategy)
+        resolved_this_run.append((entry, outcome, breaker_triggered))
 
     stats.data["pending"] = still_pending
     stats._save()
 
     # Notify in Telegram for each auto-resolved trade
-    for entry, outcome in resolved_this_run:
+    for entry, outcome, breaker_triggered in resolved_this_run:
         emoji = "✅" if outcome == "win" else "❌"
         label = "WIN" if outcome == "win" else "LOSS"
         try:
@@ -713,6 +785,26 @@ async def check_auto_outcomes(symbol: str, df):
             log.info(f"[AUTO-CHECK] {entry['id']} ({entry['symbol']}) auto-recorded as {label}")
         except Exception as e:
             log.error(f"[AUTO-CHECK] Notify error for {entry['id']}: {e}")
+
+        if breaker_triggered:
+            try:
+                strategy = entry.get("strategy", "SMC")
+                await telegram_bot.send_message(
+                    chat_id=CHAT_ID,
+                    text=(
+                        f"🚨 *CIRCUIT BREAKER TRIGGERED*\n"
+                        f"━━━━━━━━━━━━━━━━━━━━━━\n"
+                        f"🧩 Strategy: `{strategy}`\n"
+                        f"❌ {CIRCUIT_BREAKER_LOSS_STREAK} losses in a row\n"
+                        f"⏸ Paused for {CIRCUIT_BREAKER_COOLDOWN_HOURS}h — will auto-resume\n"
+                        f"━━━━━━━━━━━━━━━━━━━━━━\n"
+                        f"_Other strategies continue running normally._"
+                    ),
+                    parse_mode="Markdown"
+                )
+                log.info(f"[CIRCUIT-BREAKER] {strategy} paused for {CIRCUIT_BREAKER_COOLDOWN_HOURS}h after {CIRCUIT_BREAKER_LOSS_STREAK} consecutive losses")
+            except Exception as e:
+                log.error(f"[CIRCUIT-BREAKER] Notify error: {e}")
 
 
 # ──────────────────────────────────────────────────
@@ -741,6 +833,92 @@ def build_confluence_note(fired: list) -> str:
 
 
 # ──────────────────────────────────────────────────
+# CORRELATED-PAIR EXPOSURE CHECK
+# ──────────────────────────────────────────────────
+# XAUUSD, EURUSD, GBPUSD, and USDJPY all move on USD strength/weakness —
+# but which SIGNAL DIRECTION means "USD weak" vs "USD strong" depends on
+# which side of the pair the dollar sits on. EURUSD/GBPUSD/XAUUSD all
+# have USD as the quote currency (or inverse-correlate, for gold), so a
+# CALL on any of them implies USD weakness. USDJPY has USD as the BASE
+# currency, so it's flipped — a CALL there implies USD strength, the
+# opposite of the other three. Without this mapping, two or three
+# "different" signals firing at once can secretly be the exact same
+# underlying USD bet, stacked without anyone realizing it.
+USD_BIAS_MAP = {
+    "XAUUSD": {"CALL": "USD_WEAK", "PUT": "USD_STRONG"},
+    "EURUSD": {"CALL": "USD_WEAK", "PUT": "USD_STRONG"},
+    "GBPUSD": {"CALL": "USD_WEAK", "PUT": "USD_STRONG"},
+    "USDJPY": {"CALL": "USD_STRONG", "PUT": "USD_WEAK"},
+    # BTCUSD intentionally excluded — its correlation to USD strength is
+    # inconsistent (driven more by risk sentiment than DXY), so grouping
+    # it in here would create false-positive warnings.
+}
+
+def build_correlation_warning(all_fired_this_cycle: list) -> str:
+    """
+    Given every signal that fired across ALL pairs in this scan cycle,
+    detect whether 2+ DIFFERENT pairs are secretly the same USD bet.
+    """
+    groups = {"USD_WEAK": [], "USD_STRONG": []}
+    for entry in all_fired_this_cycle:
+        bias_map = USD_BIAS_MAP.get(entry["symbol"])
+        if not bias_map:
+            continue
+        usd_bias = bias_map.get(entry["raw_dir"])
+        if usd_bias:
+            groups[usd_bias].append(entry)
+
+    lines = []
+    for usd_bias, entries in groups.items():
+        distinct_symbols = {e["symbol"] for e in entries}
+        if len(distinct_symbols) >= 2:
+            label = "USD Weakness" if usd_bias == "USD_WEAK" else "USD Strength"
+            detail = ", ".join(f"{e['symbol']}({e['strategy']}:{e['raw_dir']})" for e in entries)
+            lines.append(f"📌 *{label}* bet stacked across {len(distinct_symbols)} pairs: {detail}")
+
+    if not lines:
+        return ""
+
+    return (
+        "⚠️ *CORRELATED EXPOSURE WARNING*\n"
+        "━━━━━━━━━━━━━━━━━━━━━━\n"
+        + "\n".join(lines) +
+        "\n━━━━━━━━━━━━━━━━━━━━━━\n"
+        "_These pairs may be the same underlying USD bet — consider reduced size across them, not full size on each._"
+    )
+
+
+async def strategy_gate(strategy: str) -> bool:
+    """
+    Checks the circuit breaker for a strategy before it runs this cycle.
+    Returns True if the strategy should evaluate/fire, False if it's
+    currently in its post-losing-streak cooldown. Sends a one-time
+    "circuit breaker lifted" notification the exact moment a cooldown
+    expires, so silence isn't the only signal that something changed.
+    """
+    is_paused, just_resumed = stats.is_strategy_paused(strategy)
+    if just_resumed:
+        try:
+            await telegram_bot.send_message(
+                chat_id=CHAT_ID,
+                text=(
+                    f"▶️ *Circuit Breaker Lifted*\n"
+                    f"━━━━━━━━━━━━━━━━━━━━━━\n"
+                    f"🧩 Strategy: `{strategy}`\n"
+                    f"Cooldown complete — resuming signals normally."
+                ),
+                parse_mode="Markdown"
+            )
+            log.info(f"[CIRCUIT-BREAKER] {strategy} auto-resumed, cooldown expired")
+        except Exception as e:
+            log.error(f"[CIRCUIT-BREAKER] Resume notify error {strategy}: {e}")
+    if is_paused:
+        log.info(f"[CIRCUIT-BREAKER] {strategy} is paused this cycle — skipping")
+        return False
+    return True
+
+
+# ──────────────────────────────────────────────────
 # SCANNER  (now runs SMC + Breakout off the same fetched candles)
 # ──────────────────────────────────────────────────
 async def scan_and_send(context=None):
@@ -749,6 +927,7 @@ async def scan_and_send(context=None):
         return
     log.info(f"🔍 Scanning | {session_name()}")
     sent = 0
+    all_fired_this_cycle = []   # tracks every signal across ALL pairs this cycle, for correlation check
     for symbol, td_symbol in PAIRS.items():
         await asyncio.sleep(15)
 
@@ -789,90 +968,100 @@ async def scan_and_send(context=None):
         fired = []   # list of dicts: strategy, raw_dir, body text, add_signal args
 
         # SMC
-        sig, sig_type = analyzer.analyze(symbol, td_symbol, df=df, htf_bias=htf_bias)
-        if sig and sig_type == "signal":
-            smc_sl, smc_tp1, _, _ = calculate_sl_tp(sig["price"], sig["raw_dir"], sig["symbol"])
-            fired.append({
-                "strategy": "SMC",
-                "raw_dir": sig["raw_dir"],
-                "body": format_signal(sig),
-                "add_args": (sig["symbol"], sig["raw_dir"], sig["price"], sig["score"], "SMC", smc_sl, smc_tp1),
-            })
-            presignal_sent.pop(symbol, None)
-        elif sig and sig_type == "presignal":
-            last_conf = presignal_sent.get(symbol, 0)
-            if sig["confidence"] >= last_conf + 5:
-                try:
-                    await telegram_bot.send_message(
-                        chat_id=CHAT_ID, text=format_presignal(sig), parse_mode="Markdown"
-                    )
-                    presignal_sent[symbol] = sig["confidence"]
-                    sent += 1
-                    log.info(f"[SMC] Pre-signal sent: {symbol} conf={sig['confidence']}%")
-                    await asyncio.sleep(2)
-                except Exception as e:
-                    log.error(f"[SMC] Pre-signal send error {symbol}: {e}")
+        if await strategy_gate("SMC"):
+            sig, sig_type = analyzer.analyze(symbol, td_symbol, df=df, htf_bias=htf_bias)
+            if sig and sig_type == "signal":
+                smc_sl, smc_tp1, _, _ = calculate_sl_tp(sig["price"], sig["raw_dir"], sig["symbol"], atr=sig.get("atr"))
+                fired.append({
+                    "strategy": "SMC",
+                    "raw_dir": sig["raw_dir"],
+                    "body": format_signal(sig),
+                    "add_args": (sig["symbol"], sig["raw_dir"], sig["price"], sig["score"], "SMC", smc_sl, smc_tp1),
+                })
+                presignal_sent.pop(symbol, None)
+            elif sig and sig_type == "presignal":
+                last_conf = presignal_sent.get(symbol, 0)
+                if sig["confidence"] >= last_conf + 5:
+                    try:
+                        await telegram_bot.send_message(
+                            chat_id=CHAT_ID, text=format_presignal(sig), parse_mode="Markdown"
+                        )
+                        presignal_sent[symbol] = sig["confidence"]
+                        sent += 1
+                        log.info(f"[SMC] Pre-signal sent: {symbol} conf={sig['confidence']}%")
+                        await asyncio.sleep(2)
+                    except Exception as e:
+                        log.error(f"[SMC] Pre-signal send error {symbol}: {e}")
+                else:
+                    log.info(f"[SMC] Pre-signal suppressed: {symbol} conf={sig['confidence']}%")
             else:
-                log.info(f"[SMC] Pre-signal suppressed: {symbol} conf={sig['confidence']}%")
-        else:
-            presignal_sent.pop(symbol, None)
+                presignal_sent.pop(symbol, None)
 
         # Breakout
-        try:
-            bsig = breakout_analyzer.analyze(symbol, df)
-            if bsig:
-                fired.append({
-                    "strategy": "BREAKOUT",
-                    "raw_dir": bsig["raw_dir"],
-                    "body": format_breakout_signal(bsig),
-                    "add_args": (bsig["symbol"], bsig["raw_dir"], bsig["price"], bsig.get("confidence", 0), "BREAKOUT", bsig.get("sl"), bsig.get("tp1")),
-                })
-        except Exception as e:
-            log.error(f"[BREAKOUT] Error {symbol}: {e}")
+        if await strategy_gate("BREAKOUT"):
+            try:
+                bsig = breakout_analyzer.analyze(symbol, df)
+                if bsig:
+                    fired.append({
+                        "strategy": "BREAKOUT",
+                        "raw_dir": bsig["raw_dir"],
+                        "body": format_breakout_signal(bsig),
+                        "add_args": (bsig["symbol"], bsig["raw_dir"], bsig["price"], bsig.get("confidence", 0), "BREAKOUT", bsig.get("sl"), bsig.get("tp1")),
+                    })
+            except Exception as e:
+                log.error(f"[BREAKOUT] Error {symbol}: {e}")
 
         # Pullback (reuses htf_bias fetched above — no extra API call)
-        try:
-            psig = pullback_analyzer.analyze(symbol, df, htf_bias)
-            if psig:
-                fired.append({
-                    "strategy": "PULLBACK",
-                    "raw_dir": psig["raw_dir"],
-                    "body": format_pullback_signal(psig),
-                    "add_args": (psig["symbol"], psig["raw_dir"], psig["price"], psig.get("confidence", 0), "PULLBACK", psig.get("sl"), psig.get("tp1")),
-                })
-        except Exception as e:
-            log.error(f"[PULLBACK] Error {symbol}: {e}")
+        if await strategy_gate("PULLBACK"):
+            try:
+                psig = pullback_analyzer.analyze(symbol, df, htf_bias)
+                if psig:
+                    fired.append({
+                        "strategy": "PULLBACK",
+                        "raw_dir": psig["raw_dir"],
+                        "body": format_pullback_signal(psig),
+                        "add_args": (psig["symbol"], psig["raw_dir"], psig["price"], psig.get("confidence", 0), "PULLBACK", psig.get("sl"), psig.get("tp1")),
+                    })
+            except Exception as e:
+                log.error(f"[PULLBACK] Error {symbol}: {e}")
 
         # Structure
-        try:
-            ssig = structure_analyzer.analyze(symbol, df)
-            if ssig:
-                fired.append({
-                    "strategy": "STRUCTURE",
-                    "raw_dir": ssig["raw_dir"],
-                    "body": format_structure_signal(ssig),
-                    "add_args": (ssig["symbol"], ssig["raw_dir"], ssig["price"], ssig.get("confidence", 0), "STRUCTURE", ssig.get("sl"), ssig.get("tp1")),
-                })
-        except Exception as e:
-            log.error(f"[STRUCTURE] Error {symbol}: {e}")
+        if await strategy_gate("STRUCTURE"):
+            try:
+                ssig = structure_analyzer.analyze(symbol, df)
+                if ssig:
+                    fired.append({
+                        "strategy": "STRUCTURE",
+                        "raw_dir": ssig["raw_dir"],
+                        "body": format_structure_signal(ssig),
+                        "add_args": (ssig["symbol"], ssig["raw_dir"], ssig["price"], ssig.get("confidence", 0), "STRUCTURE", ssig.get("sl"), ssig.get("tp1")),
+                    })
+            except Exception as e:
+                log.error(f"[STRUCTURE] Error {symbol}: {e}")
 
         # Mean Reversion (fires only when market is ranging, reuses same htf_bias)
-        try:
-            msig = meanrev_analyzer.analyze(symbol, df, htf_bias)
-            if msig:
-                fired.append({
-                    "strategy": "MEANREV",
-                    "raw_dir": msig["raw_dir"],
-                    "body": format_meanrev_signal(msig),
-                    "add_args": (msig["symbol"], msig["raw_dir"], msig["price"], msig.get("confidence", 0), "MEANREV", msig.get("sl"), msig.get("tp1")),
-                })
-        except Exception as e:
-            log.error(f"[MEANREV] Error {symbol}: {e}")
+        if await strategy_gate("MEANREV"):
+            try:
+                msig = meanrev_analyzer.analyze(symbol, df, htf_bias)
+                if msig:
+                    fired.append({
+                        "strategy": "MEANREV",
+                        "raw_dir": msig["raw_dir"],
+                        "body": format_meanrev_signal(msig),
+                        "add_args": (msig["symbol"], msig["raw_dir"], msig["price"], msig.get("confidence", 0), "MEANREV", msig.get("sl"), msig.get("tp1")),
+                    })
+            except Exception as e:
+                log.error(f"[MEANREV] Error {symbol}: {e}")
 
         # ── Confluence check across everything that fired on this pair ──
         confluence_note = build_confluence_note(fired)
         if confluence_note:
             log.info(f"[CONFLUENCE] {symbol}: {confluence_note}")
+
+        # Track for the cross-pair correlation check, which runs once
+        # after all 5 pairs have been scanned this cycle.
+        for f in fired:
+            all_fired_this_cycle.append({"symbol": symbol, "strategy": f["strategy"], "raw_dir": f["raw_dir"]})
 
         # ── Send each fired signal, annotated with the confluence note ──
         for f in fired:
@@ -890,6 +1079,19 @@ async def scan_and_send(context=None):
                 await asyncio.sleep(2)
             except Exception as e:
                 log.error(f"[{f['strategy']}] Send error {symbol}: {e}")
+
+    # ── Cross-pair correlation check — runs once, after ALL pairs have
+    # been scanned this cycle, since correlation spans different pairs
+    # rather than one pair at a time. ──
+    correlation_warning = build_correlation_warning(all_fired_this_cycle)
+    if correlation_warning:
+        log.info(f"[CORRELATION] {correlation_warning}")
+        try:
+            await telegram_bot.send_message(
+                chat_id=CHAT_ID, text=correlation_warning, parse_mode="Markdown"
+            )
+        except Exception as e:
+            log.error(f"[CORRELATION] Send error: {e}")
 
     if sent == 0:
         log.info("No qualifying signals.")
@@ -1069,7 +1271,7 @@ async def cmd_loss(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
 
     strategy = entry.get("strategy", "SMC")
-    stats.record_result(entry["symbol"], win=False, strategy=strategy)
+    breaker_triggered = stats.record_result(entry["symbol"], win=False, strategy=strategy)
 
     today  = stats.get_today_stats()
     wr     = stats.get_win_rate()
@@ -1086,6 +1288,17 @@ async def cmd_loss(update: Update, context: ContextTypes.DEFAULT_TYPE):
         f"━━━━━━━━━━━━━━━━━━━━━━\n"
         f"🧘 Use /stats for the full breakdown.",
         parse_mode="Markdown")
+
+    if breaker_triggered:
+        await update.message.reply_text(
+            f"🚨 *CIRCUIT BREAKER TRIGGERED*\n"
+            f"━━━━━━━━━━━━━━━━━━━━━━\n"
+            f"🧩 Strategy: `{strategy}`\n"
+            f"❌ {CIRCUIT_BREAKER_LOSS_STREAK} losses in a row\n"
+            f"⏸ Paused for {CIRCUIT_BREAKER_COOLDOWN_HOURS}h — will auto-resume\n"
+            f"━━━━━━━━━━━━━━━━━━━━━━\n"
+            f"_Other strategies continue running normally._",
+            parse_mode="Markdown")
 
 async def cmd_pause(update: Update, context: ContextTypes.DEFAULT_TYPE):
     global bot_paused
