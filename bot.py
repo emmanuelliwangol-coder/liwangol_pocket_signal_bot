@@ -1153,6 +1153,7 @@ async def cmd_help(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "them all, then reply with the exact ID so the right trade gets recorded.\n\n"
         "/pause — Pause signals\n"
         "/resume — Resume signals\n"
+        "/resetstats — Wipe all win/loss data and start fresh (requires confirmation)\n"
         "/help — This message",
         parse_mode="Markdown")
 
@@ -1314,6 +1315,39 @@ async def cmd_loss(update: Update, context: ContextTypes.DEFAULT_TYPE):
             f"_Other strategies continue running normally._",
             parse_mode="Markdown")
 
+async def cmd_resetstats(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not context.args or context.args[0].lower() != "confirm":
+        await update.message.reply_text(
+            "⚠️ *Reset All Stats?*\n"
+            "━━━━━━━━━━━━━━━━━━━━━━\n"
+            "This will permanently clear:\n"
+            "• Win/loss totals (all-time and today)\n"
+            "• Per-pair and per-strategy breakdowns\n"
+            "• Streaks and best streak\n"
+            "• All pending (unresolved) signals\n"
+            "• Any active circuit breaker cooldowns\n"
+            "━━━━━━━━━━━━━━━━━━━━━━\n"
+            "Trade IDs will keep counting up from where they are now — "
+            "no duplicates, so old IDs already visible in this chat stay unique.\n\n"
+            "This cannot be undone. Reply `/resetstats confirm` to proceed.",
+            parse_mode="Markdown")
+        return
+
+    next_id = stats.data.get("next_id", 1)   # preserved so Trade IDs never repeat
+    stats.data = {
+        "total": 0, "wins": 0, "losses": 0, "pending": [],
+        "pairs": {}, "daily": {}, "streak": 0, "best_streak": 0,
+        "strategies": {}, "next_id": next_id,
+    }
+    stats._save()
+    await update.message.reply_text(
+        "✅ *Stats Reset*\n"
+        "━━━━━━━━━━━━━━━━━━━━━━\n"
+        "All win/loss data cleared. Starting fresh from here.\n"
+        f"🕐 `{datetime.utcnow().strftime('%Y-%m-%d %H:%M UTC')}`",
+        parse_mode="Markdown")
+    log.info("[RESET] All stats manually reset by user")
+
 async def cmd_pause(update: Update, context: ContextTypes.DEFAULT_TYPE):
     global bot_paused
     bot_paused = True
@@ -1381,6 +1415,7 @@ def main():
     app.add_handler(CommandHandler("win",     cmd_win))
     app.add_handler(CommandHandler("loss",    cmd_loss))
     app.add_handler(CommandHandler("pause",   cmd_pause))
+    app.add_handler(CommandHandler("resetstats", cmd_resetstats))
     app.add_handler(CommandHandler("resume",  cmd_resume))
     app.add_error_handler(error_handler)
 
