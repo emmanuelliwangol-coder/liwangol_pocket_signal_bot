@@ -48,15 +48,23 @@ SL_BUFFER_PCT = {
 }
 
 # TP measured-move multiples of the prior trend leg's size
-TP_LEG_MULTIPLES = [0.5, 1.0, 1.618]   # TP1/TP2/TP3 — 1.618 = fib extension
+TP_LEG_MULTIPLES = [1.0, 1.5, 2.5]   # TP1/TP2/TP3 — same ratio pattern as Breakout/SMC
 
 # Caps how far SL can sit from ENTRY, in multiples of leg_size. Without
 # this, SL is anchored to the raw swing low/high of the last 6 candles —
 # a value with no relationship to leg_size (which drives TP). If a wick
 # a few candles back sits far from the current entry, SL balloons while
 # TP stays fixed, producing the same broken risk profile Breakout had.
-# Set to match TP1's multiple (0.5) so worst-case R:R at TP1 is ~1:1.
-MAX_SL_LEG_MULTIPLE = 0.5
+#
+# NOTE: because the actual SL always picks whichever of (natural swing
+# stop, this cap) is TIGHTER, this cap can only ever make SL equal to or
+# smaller than before — never wider. An earlier version set this to 0.5,
+# matching TP1's old multiplier exactly — which meant SL had almost no
+# room to absorb normal pullback noise before either hitting the stop or
+# TP1, causing frequent premature stop-outs even on directionally correct
+# calls. Widened to 1.0 to give real breathing room, with TP1 raised to
+# match — same 1:1 minimum R:R, just sized less like a hair-trigger.
+MAX_SL_LEG_MULTIPLE = 1.0
 
 MIN_CONFIDENCE = 50   # signals below this score are skipped, not sent
 
