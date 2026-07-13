@@ -208,18 +208,25 @@ class TrendPullbackAnalyzer:
             return None
 
         # ── Check for a pullback touch of EMA21 within the last few candles ──
+        # BUG FIX: the old condition (Low <= ema*(1+tol)) was one-sided —
+        # it excluded candles that never got near the EMA, but accepted
+        # ANY dip below it, no matter how deep. A sharp breakdown far
+        # past the EMA satisfied it just as easily as a genuine shallow
+        # touch. That's the opposite of what a pullback-continuation
+        # entry should require. Now uses the actual distance (already
+        # being computed for confidence scoring) as the real gate.
         recent = df.tail(4)
         touched = False
         best_touch_dist_pct = None
         for i in range(len(recent)):
             row = recent.iloc[i]
             ema_val = float(ema_fast.iloc[-(len(recent) - i)])
-            dist_pct = abs(row["Low"] - ema_val) / ema_val if htf_bias == "CALL" \
-                       else abs(row["High"] - ema_val) / ema_val
-            if htf_bias == "CALL" and row["Low"] <= ema_val * (1 + TOUCH_TOLERANCE_PCT):
-                touched = True
-                best_touch_dist_pct = dist_pct if best_touch_dist_pct is None else min(best_touch_dist_pct, dist_pct)
-            if htf_bias == "PUT" and row["High"] >= ema_val * (1 - TOUCH_TOLERANCE_PCT):
+            if htf_bias == "CALL":
+                dist_pct = abs(row["Low"] - ema_val) / ema_val
+            else:
+                dist_pct = abs(row["High"] - ema_val) / ema_val
+
+            if dist_pct <= TOUCH_TOLERANCE_PCT:
                 touched = True
                 best_touch_dist_pct = dist_pct if best_touch_dist_pct is None else min(best_touch_dist_pct, dist_pct)
 
