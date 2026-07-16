@@ -262,7 +262,7 @@ class StatsManager:
                 return json.load(f)
         return {"total":0,"wins":0,"losses":0,"pending":[],
                 "pairs":{},"daily":{},"streak":0,"best_streak":0,
-                "strategies":{}, "next_id":1}
+                "strategies":{}, "next_id":1, "total_r":0.0}
 
     def _save(self):
         with open(STATS_FILE,"w") as f:
@@ -284,9 +284,36 @@ class StatsManager:
         self._save()
         return trade_id
 
-    def record_result(self, symbol, win, strategy="SMC"):
+    def record_result(self, entry, win):
+        """
+        Records a trade outcome AND its actual R-multiple (reward/risk),
+        computed from the SL/TP1 stored on the entry at signal time.
+        A win isn't just "+1" anymore — it's worth whatever that
+        specific trade's real reward-to-risk ratio was. A loss is
+        always -1R (the full risk was lost, by definition of hitting SL).
+        This is what makes /stats able to show real expectancy instead
+        of a win-rate number that can't tell you if you're profitable.
+        """
+        symbol = entry["symbol"]
+        strategy = entry.get("strategy", "SMC")
         today = datetime.utcnow().strftime("%Y-%m-%d")
         self.data["total"] += 1
+
+        entry_price = entry.get("entry_price")
+        sl = entry.get("sl")
+        tp1 = entry.get("tp1")
+        if entry_price is not None and sl is not None and tp1 is not None:
+            risk = abs(entry_price - sl)
+            reward = abs(tp1 - entry_price)
+            if risk > 0:
+                r_multiple = round(reward / risk, 3) if win else -1.0
+            else:
+                r_multiple = 1.0 if win else -1.0   # fallback — risk was somehow zero
+        else:
+            r_multiple = 1.0 if win else -1.0   # fallback — SL/TP weren't stored (older entry)
+
+        self.data["total_r"] = round(self.data.get("total_r", 0.0) + r_multiple, 3)
+
         if win:
             self.data["wins"] += 1
             self.data["streak"] = self.data.get("streak",0) + 1
@@ -295,16 +322,21 @@ class StatsManager:
             self.data["streak"] = 0
         if self.data["streak"] > self.data.get("best_streak",0):
             self.data["best_streak"] = self.data["streak"]
-        self.data["pairs"].setdefault(symbol, {"wins":0,"losses":0})
+
+        self.data["pairs"].setdefault(symbol, {"wins":0,"losses":0,"total_r":0.0})
         self.data["pairs"][symbol]["wins" if win else "losses"] += 1
+        self.data["pairs"][symbol]["total_r"] = round(self.data["pairs"][symbol].get("total_r",0.0) + r_multiple, 3)
+
         self.data["daily"].setdefault(today, {"wins":0,"losses":0})
         self.data["daily"][today]["wins" if win else "losses"] += 1
+
         self.data.setdefault("strategies", {})
-        self.data["strategies"].setdefault(strategy, {"wins":0,"losses":0,"loss_streak":0,"paused_until":None})
-        self.data["strategies"][strategy]["wins" if win else "losses"] += 1
+        self.data["strategies"].setdefault(strategy, {"wins":0,"losses":0,"loss_streak":0,"paused_until":None,"total_r":0.0})
+        strat_data = self.data["strategies"][strategy]
+        strat_data["wins" if win else "losses"] += 1
+        strat_data["total_r"] = round(strat_data.get("total_r",0.0) + r_multiple, 3)
 
         # ── Circuit breaker: track consecutive losses PER STRATEGY ──
-        strat_data = self.data["strategies"][strategy]
         just_triggered = False
         if win:
             strat_data["loss_streak"] = 0
@@ -317,7 +349,7 @@ class StatsManager:
                 just_triggered = True
 
         self._save()
-        return just_triggered
+        return just_triggered, r_multiple
 
     def is_strategy_paused(self, strategy: str) -> tuple:
         """
@@ -343,6 +375,19 @@ class StatsManager:
         if self.data["total"] == 0: return 0.0
         return round((self.data["wins"]/self.data["total"])*100, 1)
 
+    def get_expectancy(self):
+        """
+        Average R per trade across everything resolved so far. This is
+        the number that actually answers "is this profitable" — win
+        rate alone can't, since a 40% win rate at 1:3 R:R is a strong
+        winner, while a 40% win rate at 1:1 is a loser.
+        Positive = profitable on average. Negative = losing on average,
+        regardless of what the win rate looks like.
+        """
+        if self.data["total"] == 0:
+            return 0.0
+        return round(self.data.get("total_r", 0.0) / self.data["total"], 3)
+
     def get_today_stats(self):
         today = datetime.utcnow().strftime("%Y-%m-%d")
         return self.data["daily"].get(today, {"wins":0,"losses":0})
@@ -360,19 +405,24 @@ class StatsManager:
     def format_stats(self):
         d = self.data
         wr = self.get_win_rate()
+        expectancy = self.get_expectancy()
         today = self.get_today_stats()
         pb = ""
         for sym, rec in d.get("pairs",{}).items():
             tot = rec["wins"]+rec["losses"]
             rate = round(rec["wins"]/tot*100,1) if tot else 0
             bar = "🟩" if rate>=60 else "🟨" if rate>=50 else "🟥"
-            pb += f"  {bar} `{sym}`: {rec['wins']}W/{rec['losses']}L ({rate}%)\n"
+            sym_exp = round(rec.get("total_r", 0.0) / tot, 2) if tot else 0.0
+            exp_sign = "+" if sym_exp >= 0 else ""
+            pb += f"  {bar} `{sym}`: {rec['wins']}W/{rec['losses']}L ({rate}%) `{exp_sign}{sym_exp}R`\n"
 
         sb = ""
         for strat, rec in d.get("strategies", {}).items():
             tot = rec["wins"]+rec["losses"]
             rate = round(rec["wins"]/tot*100,1) if tot else 0
             bar = "🟩" if rate>=60 else "🟨" if rate>=50 else "🟥"
+            strat_exp = round(rec.get("total_r", 0.0) / tot, 2) if tot else 0.0
+            exp_sign = "+" if strat_exp >= 0 else ""
             paused_until = rec.get("paused_until")
             pause_note = ""
             if paused_until:
@@ -383,19 +433,28 @@ class StatsManager:
                         pause_note = f" ⏸ _paused ~{hrs_left}h left_"
                 except Exception:
                     pass
-            sb += f"  {bar} `{strat}`: {rec['wins']}W/{rec['losses']}L ({rate}%){pause_note}\n"
+            sb += f"  {bar} `{strat}`: {rec['wins']}W/{rec['losses']}L ({rate}%) `{exp_sign}{strat_exp}R`{pause_note}\n"
+
+        exp_sign_overall = "+" if expectancy >= 0 else ""
+        exp_verdict = (
+            "🟢 Profitable on average" if expectancy > 0.05 else
+            "🔴 Losing on average" if expectancy < -0.05 else
+            "🟡 Roughly breakeven"
+        )
 
         return (
             f"📊 *BOT PERFORMANCE — MULTI-STRATEGY*\n"
             f"━━━━━━━━━━━━━━━━━━━━━━\n"
             f"🏆 *Win Rate*\n{self._bar(wr)} `{wr}%`\n\n"
+            f"📐 *Expectancy*: `{exp_sign_overall}{expectancy}R` per trade\n"
+            f"{exp_verdict}\n\n"
             f"📈 Total: `{d['total']}`\n"
             f"✅ Wins: `{d['wins']}`  ❌ Losses: `{d['losses']}`\n\n"
             f"📅 *Today*: ✅ {today['wins']}W  ❌ {today['losses']}L\n\n"
             f"🔥 Streak: `{d.get('streak',0)}`  🥇 Best: `{d.get('best_streak',0)}`\n"
             f"💎 Best Pair: `{self.get_best_pair()}`\n\n"
-            f"📊 *Pair Breakdown*\n{pb}\n"
-            f"🧩 *Strategy Breakdown*\n{sb}"
+            f"📊 *Pair Breakdown* (W/L, win%, avg R)\n{pb}\n"
+            f"🧩 *Strategy Breakdown* (W/L, win%, avg R)\n{sb}"
             f"━━━━━━━━━━━━━━━━━━━━━━\n"
             f"🕐 `{datetime.utcnow().strftime('%H:%M UTC')}`"
         )
@@ -770,17 +829,17 @@ async def check_auto_outcomes(symbol: str, df):
             continue
 
         # Resolved — record it
-        strategy = entry.get("strategy", "SMC")
-        breaker_triggered = stats.record_result(entry["symbol"], win=(outcome == "win"), strategy=strategy)
-        resolved_this_run.append((entry, outcome, breaker_triggered))
+        breaker_triggered, r_multiple = stats.record_result(entry, win=(outcome == "win"))
+        resolved_this_run.append((entry, outcome, breaker_triggered, r_multiple))
 
     stats.data["pending"] = still_pending
     stats._save()
 
     # Notify in Telegram for each auto-resolved trade
-    for entry, outcome, breaker_triggered in resolved_this_run:
+    for entry, outcome, breaker_triggered, r_multiple in resolved_this_run:
         emoji = "✅" if outcome == "win" else "❌"
         label = "WIN" if outcome == "win" else "LOSS"
+        r_label = f"+{r_multiple}R" if r_multiple >= 0 else f"{r_multiple}R"
         try:
             await telegram_bot.send_message(
                 chat_id=CHAT_ID,
@@ -789,14 +848,14 @@ async def check_auto_outcomes(symbol: str, df):
                     f"━━━━━━━━━━━━━━━━━━━━━━\n"
                     f"🆔 Trade: `{entry['id']}`\n"
                     f"💱 Pair: `{entry['symbol']}`  |  🧩 `{entry.get('strategy','SMC')}`\n"
-                    f"{emoji} Result: *{label}*\n"
+                    f"{emoji} Result: *{label}* (`{r_label}`)\n"
                     f"━━━━━━━━━━━━━━━━━━━━━━\n"
                     f"📊 *Overall Win Rate*: `{stats.get_win_rate()}%`\n"
                     f"_Detected from market data — no action needed._"
                 ),
                 parse_mode="Markdown"
             )
-            log.info(f"[AUTO-CHECK] {entry['id']} ({entry['symbol']}) auto-recorded as {label}")
+            log.info(f"[AUTO-CHECK] {entry['id']} ({entry['symbol']}) auto-recorded as {label} ({r_label})")
         except Exception as e:
             log.error(f"[AUTO-CHECK] Notify error for {entry['id']}: {e}")
 
@@ -1251,7 +1310,8 @@ async def cmd_win(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
 
     strategy = entry.get("strategy", "SMC")
-    stats.record_result(entry["symbol"], win=True, strategy=strategy)
+    _, r_multiple = stats.record_result(entry, win=True)
+    r_label = f"+{r_multiple}R"
 
     today   = stats.get_today_stats()
     wr      = stats.get_win_rate()
@@ -1259,7 +1319,7 @@ async def cmd_win(update: Update, context: ContextTypes.DEFAULT_TYPE):
     streak_txt = f"🔥 Streak: `{streak}`" if streak > 1 else ""
 
     await update.message.reply_text(
-        f"✅ *WIN RECORDED!*\n"
+        f"✅ *WIN RECORDED!* (`{r_label}`)\n"
         f"━━━━━━━━━━━━━━━━━━━━━━\n"
         f"🆔 Trade: `{entry.get('id','?')}`\n"
         f"💱 Pair: `{entry['symbol']}`  |  🧩 `{strategy}`\n"
@@ -1286,13 +1346,14 @@ async def cmd_loss(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
 
     strategy = entry.get("strategy", "SMC")
-    breaker_triggered = stats.record_result(entry["symbol"], win=False, strategy=strategy)
+    breaker_triggered, r_multiple = stats.record_result(entry, win=False)
+    r_label = f"{r_multiple}R"
 
     today  = stats.get_today_stats()
     wr     = stats.get_win_rate()
 
     await update.message.reply_text(
-        f"❌ *LOSS RECORDED*\n"
+        f"❌ *LOSS RECORDED* (`{r_label}`)\n"
         f"━━━━━━━━━━━━━━━━━━━━━━\n"
         f"🆔 Trade: `{entry.get('id','?')}`\n"
         f"💱 Pair: `{entry['symbol']}`  |  🧩 `{strategy}`\n"
@@ -1337,7 +1398,7 @@ async def cmd_resetstats(update: Update, context: ContextTypes.DEFAULT_TYPE):
     stats.data = {
         "total": 0, "wins": 0, "losses": 0, "pending": [],
         "pairs": {}, "daily": {}, "streak": 0, "best_streak": 0,
-        "strategies": {}, "next_id": next_id,
+        "strategies": {}, "next_id": next_id, "total_r": 0.0,
     }
     stats._save()
     await update.message.reply_text(
