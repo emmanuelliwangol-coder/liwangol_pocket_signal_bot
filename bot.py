@@ -214,21 +214,36 @@ class StatsTracker:
                 with open(STATS_FILE) as f:
                     return json.load(f)
         except: pass
-        return {"trades":[], "pending":[], "streak":0, "best_streak":0}
+        return {"trades":[], "pending":[], "streak":0, "best_streak":0, "trade_counter":0}
+
+    def next_trade_id(self) -> str:
+        self.data["trade_counter"] = self.data.get("trade_counter", 0) + 1
+        self._save()
+        return f"#TRD-{self.data['trade_counter']:03d}"
 
     def _save(self):
         with open(STATS_FILE, "w") as f:
             json.dump(self.data, f, indent=2)
 
     def add_pending(self, sig: dict):
+        trade_id = self.next_trade_id()
+        entry = sig["price"]
+        sl, tp1, tp2, tp3 = calculate_sl_tp(entry, sig["raw_dir"], sig["symbol"])
         self.data.setdefault("pending",[]).append({
+            "trade_id":  trade_id,
             "symbol":    sig["symbol"],
             "direction": sig["direction"],
             "raw_dir":   sig["raw_dir"],
             "session":   sig["session"],
+            "entry":     entry,
+            "sl":        sl,
+            "tp1":       tp1,
+            "tp2":       tp2,
+            "tp3":       tp3,
             "time":      datetime.utcnow().isoformat(),
         })
         self._save()
+        return trade_id
 
     def record_result(self, symbol: str, win: bool, session: str = ""):
         today = datetime.utcnow().strftime("%Y-%m-%d")
@@ -613,7 +628,7 @@ def confidence_bar(pct: int, color: str = "🟢") -> str:
     filled = round(pct / 10)
     return color * filled + "⬜" * (10 - filled) + f" `{pct}%`"
 
-def format_signal(sig: dict) -> str:
+def format_signal(sig: dict, trade_id: str = "") -> str:
     now   = datetime.utcnow()
     lines = "\n".join(f"    {t}" for t in sig["smc_tags"])
     stars = "⭐" * sig["score"]
@@ -630,9 +645,12 @@ def format_signal(sig: dict) -> str:
     if weight > 1.0:   learn_note = "🧠 _Boosted by learning engine_"
     elif weight < 1.0: learn_note = "🧠 _Filtered by learning engine_"
 
+    tid_line = f"🔖 Trade ID: `{trade_id}`\n" if trade_id else ""
+
     return (
         f"🚨 *SMC PRO SIGNAL*\n"
         f"━━━━━━━━━━━━━━━━━━━━━━\n"
+        f"{tid_line}"
         f"💱 Pair: `{sig['symbol']}`\n"
         f"🎯 Direction: *{sig['direction']}*\n"
         f"📍 Session: {sig['session']}\n"
@@ -654,7 +672,7 @@ def format_signal(sig: dict) -> str:
         f"💥 Strength: *{'🔥 VERY STRONG' if sig['score']>=6 else '💪 STRONG' if sig['score']>=4 else '✅ GOOD'}*\n"
         f"🕐 `{now.strftime('%H:%M:%S UTC')}`\n"
         f"⚠️ _Risk management always applies_\n"
-        f"📝 _Reply /win or /loss after trade_"
+        f"📝 _Reply /win {trade_id} or /loss {trade_id} to record_"
     )
 
 def format_presignal(sig: dict) -> str:
@@ -684,8 +702,56 @@ def format_presignal(sig: dict) -> str:
 
 
 # ══════════════════════════════════════════════════════════════
+# SEED HISTORICAL DATA (runs once if no learning data exists)
+# ══════════════════════════════════════════════════════════════
+def seed_historical_data():
+    """
+    Pre-loads Emmanuel's 42 real trades into the learning engine.
+    Only runs if learning.json doesn't exist yet.
+    """
+    if Path(LEARN_FILE).exists():
+        return  # Already seeded
+
+    log.info("🧠 Seeding learning engine with historical trade data...")
+    data = {
+        "pair_stats": {
+            "XAUUSD": {"wins": 1,  "losses": 8},
+            "EURUSD": {"wins": 7,  "losses": 1},
+            "GBPUSD": {"wins": 6,  "losses": 1},
+            "USDJPY": {"wins": 5,  "losses": 3},
+            "BTCUSD": {"wins": 4,  "losses": 6},
+        },
+        "session_stats": {
+            "london":  {"wins": 12, "losses": 10},
+            "newyork": {"wins": 11, "losses": 9},
+        },
+        "pair_weights": {
+            "XAUUSD": 0.5,
+            "EURUSD": 1.3,
+            "GBPUSD": 1.3,
+            "USDJPY": 1.0,
+            "BTCUSD": 0.8,
+        },
+        "pair_threshold": {
+            "XAUUSD": 80,
+            "EURUSD": 45,
+            "GBPUSD": 45,
+            "USDJPY": 55,
+            "BTCUSD": 65,
+        },
+        "suppressed_pairs": ["XAUUSD"],
+        "total_evaluated": 42,
+        "last_evaluation": "2026-07-18T14:00:00",
+    }
+    with open(LEARN_FILE, "w") as f:
+        json.dump(data, f, indent=2)
+    log.info("✅ Historical data seeded: EURUSD/GBPUSD boosted, XAUUSD suppressed")
+
+
+# ══════════════════════════════════════════════════════════════
 # INIT GLOBAL OBJECTS
 # ══════════════════════════════════════════════════════════════
+seed_historical_data()
 stats    = StatsTracker()
 learning = LearningEngine()
 analyzer = SMCAnalyzer()
@@ -707,14 +773,14 @@ async def scan_and_send(context=None):
 
         if sig and sig_type == "signal":
             try:
+                trade_id = stats.add_pending(sig)
                 await telegram_bot.send_message(
                     chat_id=CHAT_ID,
-                    text=format_signal(sig),
+                    text=format_signal(sig, trade_id),
                     parse_mode="Markdown"
                 )
-                stats.add_pending(sig)
                 presignal_sent.pop(symbol, None)
-                log.info(f"✅ Signal sent: {symbol} {sig['direction']} ({sig['confidence']}%)")
+                log.info(f"✅ Signal sent: {symbol} {sig['direction']} ({sig['confidence']}%) {trade_id}")
             except Exception as e:
                 log.error(f"Send error: {e}")
 
@@ -858,9 +924,11 @@ async def cmd_win(update: Update, context: ContextTypes.DEFAULT_TYPE):
     today  = stats.get_today_stats()
     wr     = stats.get_win_rate()
     streak = stats.data.get("streak", 0)
+    tid = entry.get("trade_id", "")
     await update.message.reply_text(
         f"✅ *WIN RECORDED!*\n"
         f"━━━━━━━━━━━━━━━━━━━━━━\n"
+        f"🔖 Trade ID: `{tid}`\n"
         f"💱 Pair: `{entry['symbol']}` | {entry.get('direction','')}\n"
         f"📍 Session: {entry.get('session','')}\n"
         f"━━━━━━━━━━━━━━━━━━━━━━\n"
@@ -884,9 +952,11 @@ async def cmd_loss(update: Update, context: ContextTypes.DEFAULT_TYPE):
     learning.record(entry["symbol"], entry.get("session",""), win=False)
     today = stats.get_today_stats()
     wr    = stats.get_win_rate()
+    tid = entry.get("trade_id", "")
     await update.message.reply_text(
         f"❌ *LOSS RECORDED*\n"
         f"━━━━━━━━━━━━━━━━━━━━━━\n"
+        f"🔖 Trade ID: `{tid}`\n"
         f"💱 Pair: `{entry['symbol']}` | {entry.get('direction','')}\n"
         f"📍 Session: {entry.get('session','')}\n"
         f"━━━━━━━━━━━━━━━━━━━━━━\n"
