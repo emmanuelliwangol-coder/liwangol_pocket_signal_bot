@@ -754,7 +754,7 @@ def seed_historical_data():
 seed_historical_data()
 stats    = StatsTracker()
 learning = LearningEngine()
-analyzer = SMCAnalyzer()
+analyzer = AdaptiveStrategySelector()
 
 
 # ══════════════════════════════════════════════════════════════
@@ -769,7 +769,7 @@ async def scan_and_send(context=None):
 
     for symbol, td_symbol in PAIRS.items():
         await asyncio.sleep(15)
-        sig, sig_type = analyzer.analyze(symbol, td_symbol, learning)
+        sig, sig_type = analyzer.select(symbol, td_symbol, learning)
 
         if sig and sig_type == "signal":
             try:
