@@ -621,6 +621,216 @@ class SMCAnalyzer:
             return None, None
 
 
+
+# ══════════════════════════════════════════════════════════════
+# STRATEGY 2: TREND PULLBACK
+# ══════════════════════════════════════════════════════════════
+class TrendPullbackAnalyzer:
+    def analyze(self, symbol, td_symbol, df, htf_bias, learning):
+        if len(df) < 55: return None, None
+        close = df["Close"]; high = df["High"]; low = df["Low"]
+        ema20 = close.ewm(span=20).mean()
+        ema50 = close.ewm(span=50).mean()
+        rsi   = ta.momentum.RSIIndicator(close, window=14).rsi()
+        price = close.iloc[-1]; e20 = ema20.iloc[-1]; e50 = ema50.iloc[-1]; rsi_val = rsi.iloc[-1]
+        uptrend   = e20 > e50 and close.iloc[-3] > e20
+        downtrend = e20 < e50 and close.iloc[-3] < e20
+        bull_pb = uptrend   and low.iloc[-1]  <= e20 * 1.001 and price > e20 and rsi_val < 55
+        bear_pb = downtrend and high.iloc[-1] >= e20 * 0.999 and price < e20 and rsi_val > 45
+        if not bull_pb and not bear_pb: return None, None
+        bias = "CALL" if bull_pb else "PUT"
+        emoji = "✅ CALL" if bull_pb else "🔴 PUT"
+        tags = ([f"📈 Uptrend EMA20>{round(e20,5)}", "🔄 Pullback to EMA20", f"📊 RSI {rsi_val:.1f}"]
+                if bull_pb else
+                [f"📉 Downtrend EMA20<{round(e20,5)}", "🔄 Pullback to EMA20", f"📊 RSI {rsi_val:.1f}"])
+        confidence = min(62 + (10 if htf_bias == bias else 0), 100)
+        weight = learning.get_weight(symbol)
+        confidence = min(int(confidence * weight), 100)
+        threshold = learning.get_threshold(symbol)
+        sig = {"symbol":symbol,"direction":emoji,"raw_dir":bias,"price":round(price,5),"rsi":rsi_val,
+               "score":len(tags),"confidence":confidence,"threshold":threshold,"smc_tags":tags,
+               "pending_tags":[],"session":session_name(symbol),"htf_bias":htf_bias or "Neutral",
+               "weight":weight,"strategy":"Trend Pullback"}
+        if confidence >= threshold: return sig, "signal"
+        if confidence >= PRE_SIGNAL_MIN: return sig, "presignal"
+        return None, None
+
+
+# ══════════════════════════════════════════════════════════════
+# STRATEGY 3: LONDON BREAKOUT
+# ══════════════════════════════════════════════════════════════
+class LondonBreakoutAnalyzer:
+    def analyze(self, symbol, td_symbol, df, htf_bias, learning):
+        now = datetime.utcnow(); hour = now.hour
+        if not (8 <= hour < 9) or symbol == "BTCUSD" or len(df) < 20: return None, None
+        close = df["Close"]; high = df["High"]; low = df["Low"]
+        pre_high = high.iloc[-10:-2].max(); pre_low = low.iloc[-10:-2].min()
+        price = close.iloc[-1]; rng = pre_high - pre_low
+        if rng < price * 0.0005: return None, None
+        bull_break = price > pre_high * 1.0002
+        bear_break = price < pre_low  * 0.9998
+        if not bull_break and not bear_break: return None, None
+        bias = "CALL" if bull_break else "PUT"
+        emoji = "✅ CALL" if bull_break else "🔴 PUT"
+        tags = [f"🇬🇧 London Breakout {'Above' if bull_break else 'Below'} Range",
+                f"📏 Range: {round(pre_low,5)}—{round(pre_high,5)}",
+                f"💥 Break Price: {round(price,5)}"]
+        confidence = min(68 + (10 if htf_bias == bias else 0), 100)
+        weight = learning.get_weight(symbol)
+        confidence = min(int(confidence * weight), 100)
+        threshold = learning.get_threshold(symbol)
+        sig = {"symbol":symbol,"direction":emoji,"raw_dir":bias,"price":round(price,5),"rsi":50,
+               "score":len(tags),"confidence":confidence,"threshold":threshold,"smc_tags":tags,
+               "pending_tags":[],"session":session_name(symbol),"htf_bias":htf_bias or "Neutral",
+               "weight":weight,"strategy":"London Breakout"}
+        if confidence >= threshold: return sig, "signal"
+        if confidence >= PRE_SIGNAL_MIN: return sig, "presignal"
+        return None, None
+
+
+# ══════════════════════════════════════════════════════════════
+# STRATEGY 4: PRICE ACTION + MARKET STRUCTURE
+# ══════════════════════════════════════════════════════════════
+class PriceActionAnalyzer:
+    def analyze(self, symbol, td_symbol, df, htf_bias, learning):
+        if len(df) < 20: return None, None
+        close = df["Close"]; high = df["High"]; low = df["Low"]
+        price = close.iloc[-1]
+        hh = high.iloc[-1] > high.iloc[-3] > high.iloc[-5]
+        hl = low.iloc[-1]  > low.iloc[-3]  > low.iloc[-5]
+        lh = high.iloc[-1] < high.iloc[-3] < high.iloc[-5]
+        ll = low.iloc[-1]  < low.iloc[-3]  < low.iloc[-5]
+        bull_struct = hh and hl; bear_struct = lh and ll
+        if not bull_struct and not bear_struct: return None, None
+        body = abs(close.iloc[-1] - df["Open"].iloc[-1])
+        candle = high.iloc[-1] - low.iloc[-1]
+        pin_bar = candle > 0 and body < candle * 0.35
+        rsi_val = ta.momentum.RSIIndicator(close, window=14).rsi().iloc[-1]
+        bull_ok = bull_struct and rsi_val < 60
+        bear_ok = bear_struct and rsi_val > 40
+        if not bull_ok and not bear_ok: return None, None
+        bias = "CALL" if bull_ok else "PUT"
+        emoji = "✅ CALL" if bull_ok else "🔴 PUT"
+        tags = (["📈 HH+HL Bullish Structure", f"📊 RSI {rsi_val:.1f}"] +
+                (["📌 Bullish Pin Bar"] if pin_bar else [])
+                if bull_ok else
+                ["📉 LH+LL Bearish Structure", f"📊 RSI {rsi_val:.1f}"] +
+                (["📌 Bearish Pin Bar"] if pin_bar else []))
+        confidence = min(60 + (10 if htf_bias == bias else 0) + (8 if pin_bar else 0), 100)
+        weight = learning.get_weight(symbol)
+        confidence = min(int(confidence * weight), 100)
+        threshold = learning.get_threshold(symbol)
+        sig = {"symbol":symbol,"direction":emoji,"raw_dir":bias,"price":round(price,5),"rsi":rsi_val,
+               "score":len(tags),"confidence":confidence,"threshold":threshold,"smc_tags":tags,
+               "pending_tags":[],"session":session_name(symbol),"htf_bias":htf_bias or "Neutral",
+               "weight":weight,"strategy":"Price Action + Structure"}
+        if confidence >= threshold: return sig, "signal"
+        if confidence >= PRE_SIGNAL_MIN: return sig, "presignal"
+        return None, None
+
+
+# ══════════════════════════════════════════════════════════════
+# STRATEGY 5: TOP DOWN ANALYSIS
+# ══════════════════════════════════════════════════════════════
+class TopDownAnalyzer:
+    def analyze(self, symbol, td_symbol, df, htf_bias, learning):
+        if len(df) < 30 or htf_bias is None: return None, None
+        close = df["Close"]; high = df["High"]; low = df["Low"]
+        price = close.iloc[-1]
+        rsi_val = ta.momentum.RSIIndicator(close, window=14).rsi().iloc[-1]
+        ema20 = close.ewm(span=20).mean().iloc[-1]
+        if htf_bias == "CALL":
+            m15_ok = price > ema20 and rsi_val < 65
+            touched = low.iloc[-3:].min() <= ema20 * 1.002
+        else:
+            m15_ok = price < ema20 and rsi_val > 35
+            touched = high.iloc[-3:].max() >= ema20 * 0.998
+        if not m15_ok or not touched: return None, None
+        bias = htf_bias
+        emoji = "✅ CALL" if bias == "CALL" else "🔴 PUT"
+        tags = [f"🔭 1H Bias: {htf_bias} (Top Down Confirmed)",
+                "📐 15M Aligned with HTF",
+                f"🎯 EMA20 Entry Zone ({round(ema20,5)})",
+                f"📊 RSI: {rsi_val:.1f}"]
+        confidence = 72
+        weight = learning.get_weight(symbol)
+        confidence = min(int(confidence * weight), 100)
+        threshold = learning.get_threshold(symbol)
+        sig = {"symbol":symbol,"direction":emoji,"raw_dir":bias,"price":round(price,5),"rsi":rsi_val,
+               "score":len(tags),"confidence":confidence,"threshold":threshold,"smc_tags":tags,
+               "pending_tags":[],"session":session_name(symbol),"htf_bias":htf_bias or "Neutral",
+               "weight":weight,"strategy":"Top Down Analysis"}
+        if confidence >= threshold: return sig, "signal"
+        if confidence >= PRE_SIGNAL_MIN: return sig, "presignal"
+        return None, None
+
+
+# ══════════════════════════════════════════════════════════════
+# MARKET CONDITION DETECTOR
+# ══════════════════════════════════════════════════════════════
+def detect_market_condition(df):
+    if len(df) < 30: return "ranging"
+    try:
+        close = df["Close"]; high = df["High"]; low = df["Low"]
+        adx_ind = ta.trend.ADXIndicator(high, low, close, window=14)
+        adx_val = adx_ind.adx().iloc[-1]
+        dip     = adx_ind.adx_pos().iloc[-1]
+        din     = adx_ind.adx_neg().iloc[-1]
+        ema20   = close.ewm(span=20).mean().iloc[-1]
+        ema50   = close.ewm(span=50).mean().iloc[-1]
+        if adx_val > 25:
+            if dip > din and ema20 > ema50: return "trending_up"
+            if din > dip and ema20 < ema50: return "trending_down"
+        return "ranging"
+    except:
+        return "ranging"
+
+
+# ══════════════════════════════════════════════════════════════
+# ADAPTIVE STRATEGY SELECTOR
+# ══════════════════════════════════════════════════════════════
+class AdaptiveStrategySelector:
+    def __init__(self):
+        self.smc      = SMCAnalyzer()
+        self.pullback = TrendPullbackAnalyzer()
+        self.breakout = LondonBreakoutAnalyzer()
+        self.pa       = PriceActionAnalyzer()
+        self.topdown  = TopDownAnalyzer()
+
+    def select(self, symbol, td_symbol, learning):
+        if not is_active_session(symbol): return None, None
+        if learning.is_suppressed(symbol):
+            log.info(f"🔴 {symbol} suppressed — skip")
+            return None, None
+        if symbol == "BTCUSD":
+            df = fetch_binance_candles("BTCUSDT", interval="15m", limit=100)
+        else:
+            df = fetch_candles(td_symbol, interval="15min", outputsize=100)
+        if df is None or len(df) < 30: return None, None
+        htf = self.smc.get_htf_bias(td_symbol, symbol)
+        condition = detect_market_condition(df)
+        hour = datetime.utcnow().hour
+        log.info(f"  {symbol}: cond={condition}, htf={htf}, hour={hour}UTC")
+        candidates = []
+        if 8 <= hour < 9:
+            r = self.breakout.analyze(symbol, td_symbol, df, htf, learning)
+            if r[0]: candidates.append(r)
+        if htf:
+            r = self.topdown.analyze(symbol, td_symbol, df, htf, learning)
+            if r[0]: candidates.append(r)
+        if condition in ("trending_up","trending_down"):
+            r = self.pullback.analyze(symbol, td_symbol, df, htf, learning)
+            if r[0]: candidates.append(r)
+        r = self.pa.analyze(symbol, td_symbol, df, htf, learning)
+        if r[0]: candidates.append(r)
+        r = self.smc.analyze(symbol, td_symbol, learning)
+        if r[0]: candidates.append(r)
+        if not candidates: return None, None
+        best_sig, best_type = max(candidates, key=lambda x: x[0]["confidence"])
+        log.info(f"  ✅ Best: {best_sig.get('strategy','SMC')} ({best_sig['confidence']}%)")
+        return best_sig, best_type
+
+
 # ══════════════════════════════════════════════════════════════
 # SIGNAL FORMATTERS
 # ══════════════════════════════════════════════════════════════
@@ -648,7 +858,7 @@ def format_signal(sig: dict, trade_id: str = "") -> str:
     tid_line = f"🔖 Trade ID: `{trade_id}`\n" if trade_id else ""
 
     return (
-        f"🚨 *SMC PRO SIGNAL*\n"
+        f"🚨 *{sig.get('strategy', 'SMC PRO')} SIGNAL*\n"
         f"━━━━━━━━━━━━━━━━━━━━━━\n"
         f"{tid_line}"
         f"💱 Pair: `{sig['symbol']}`\n"
