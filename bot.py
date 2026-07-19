@@ -11,8 +11,8 @@
 import asyncio, json, os, logging, requests, ta, numpy as np, pandas as pd, signal
 from datetime import datetime, timedelta
 from pathlib import Path
-from telegram import Update
-from telegram.ext import Application, CommandHandler, ContextTypes
+from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
+from telegram.ext import Application, CommandHandler, CallbackQueryHandler, ContextTypes
 
 # ── CONFIG ────────────────────────────────────────────────────
 BOT_TOKEN   = os.getenv("BOT_TOKEN", "")
@@ -27,6 +27,8 @@ BASE_CONFIDENCE = 55      # base confidence threshold (%)
 PRE_SIGNAL_MIN  = 40      # pre-signal alert threshold (%)
 MAX_SCORE       = 7
 STATS_FILE      = "stats.json"
+OUTCOME_FILE    = "outcomes.json"   # pending outcome checks
+OUTCOME_CHECK_MINS = 15             # check outcome after this many minutes
 LEARN_FILE      = "learning.json"
 
 PAIRS = {
@@ -912,6 +914,108 @@ def format_presignal(sig: dict) -> str:
 
 
 # ══════════════════════════════════════════════════════════════
+# AUTO-OUTCOME TRACKER
+# ══════════════════════════════════════════════════════════════
+class OutcomeTracker:
+    """
+    Tracks pending trades and auto-detects win/loss by checking
+    if price hit TP1 or SL using candle High/Low (catches wicks).
+    After auto-detection, sends confirmation buttons to user.
+    """
+    def __init__(self):
+        self.data = self._load()
+
+    def _load(self):
+        try:
+            if Path(OUTCOME_FILE).exists():
+                with open(OUTCOME_FILE) as f:
+                    return json.load(f)
+        except: pass
+        return {"pending": []}
+
+    def _save(self):
+        with open(OUTCOME_FILE, "w") as f:
+            json.dump(self.data, f, indent=2)
+
+    def add(self, trade_id, symbol, raw_dir, entry, sl, tp1, tp2, tp3, session):
+        self.data["pending"].append({
+            "trade_id":   trade_id,
+            "symbol":     symbol,
+            "raw_dir":    raw_dir,
+            "entry":      entry,
+            "sl":         sl,
+            "tp1":        tp1,
+            "tp2":        tp2,
+            "tp3":        tp3,
+            "session":    session,
+            "time":       datetime.utcnow().isoformat(),
+            "check_after": (datetime.utcnow() + timedelta(minutes=OUTCOME_CHECK_MINS)).isoformat(),
+            "confirmed":  False,
+        })
+        self._save()
+
+    def get_due(self):
+        """Return trades whose check time has passed and are not yet confirmed."""
+        now = datetime.utcnow()
+        due = []
+        for t in self.data["pending"]:
+            if t.get("confirmed"): continue
+            check_time = datetime.fromisoformat(t["check_after"])
+            if now >= check_time:
+                due.append(t)
+        return due
+
+    def mark_confirmed(self, trade_id):
+        for t in self.data["pending"]:
+            if t["trade_id"] == trade_id:
+                t["confirmed"] = True
+        self._save()
+
+    def check_outcome(self, trade: dict) -> str | None:
+        """
+        Fetch latest candles and check if SL or TP1 was hit.
+        Uses High/Low of candles (catches wicks, not just close).
+        Returns: 'win', 'loss', or None (still open)
+        """
+        symbol  = trade["symbol"]
+        raw_dir = trade["raw_dir"]
+        sl      = trade["sl"]
+        tp1     = trade["tp1"]
+
+        try:
+            if symbol == "BTCUSD":
+                df = fetch_binance_candles("BTCUSDT", interval="15m", limit=10)
+            else:
+                td_symbol = PAIRS.get(symbol, symbol)
+                df = fetch_candles(td_symbol, interval="15min", outputsize=10)
+
+            if df is None or len(df) < 2:
+                return None
+
+            # Check last 3 candles High/Low for TP/SL hits
+            recent = df.tail(3)
+            highs  = recent["High"].values
+            lows   = recent["Low"].values
+
+            if raw_dir == "CALL":
+                # Win: any candle high touched TP1
+                if any(h >= tp1 for h in highs): return "win"
+                # Loss: any candle low touched SL
+                if any(l <= sl  for l in lows):  return "loss"
+            else:  # PUT
+                # Win: any candle low touched TP1
+                if any(l <= tp1 for l in lows):  return "win"
+                # Loss: any candle high touched SL
+                if any(h >= sl  for h in highs): return "loss"
+
+            return None  # Still open
+
+        except Exception as e:
+            log.warning(f"Outcome check error {symbol}: {e}")
+            return None
+
+
+# ══════════════════════════════════════════════════════════════
 # SEED HISTORICAL DATA (runs once if no learning data exists)
 # ══════════════════════════════════════════════════════════════
 def seed_historical_data():
@@ -962,9 +1066,10 @@ def seed_historical_data():
 # INIT GLOBAL OBJECTS
 # ══════════════════════════════════════════════════════════════
 seed_historical_data()
-stats    = StatsTracker()
-learning = LearningEngine()
-analyzer = AdaptiveStrategySelector()
+stats          = StatsTracker()
+learning       = LearningEngine()
+analyzer       = AdaptiveStrategySelector()
+outcome_tracker = OutcomeTracker()
 
 
 # ══════════════════════════════════════════════════════════════
@@ -984,6 +1089,15 @@ async def scan_and_send(context=None):
         if sig and sig_type == "signal":
             try:
                 trade_id = stats.add_pending(sig)
+                entry = sig["price"]
+                sl, tp1, tp2, tp3 = calculate_sl_tp(entry, sig["raw_dir"], symbol)
+                # Register with auto-outcome tracker
+                outcome_tracker.add(
+                    trade_id=trade_id, symbol=symbol,
+                    raw_dir=sig["raw_dir"], entry=entry,
+                    sl=sl, tp1=tp1, tp2=tp2, tp3=tp3,
+                    session=sig["session"]
+                )
                 await telegram_bot.send_message(
                     chat_id=CHAT_ID,
                     text=format_signal(sig, trade_id),
@@ -1011,6 +1125,158 @@ async def scan_and_send(context=None):
                     log.error(f"Pre-signal send error: {e}")
 
     log.info("✅ Scan complete.")
+
+
+# ══════════════════════════════════════════════════════════════
+# AUTO OUTCOME CHECKER (runs every 5 mins via job queue)
+# ══════════════════════════════════════════════════════════════
+async def auto_check_outcomes(context=None):
+    """
+    Runs every 5 minutes. Checks pending trades for TP/SL hits.
+    If detected: sends confirmation buttons to user.
+    If still open after 2 hours: sends manual confirmation request.
+    """
+    if telegram_bot is None: return
+    due = outcome_tracker.get_due()
+    if not due: return
+
+    for trade in due:
+        trade_id = trade["trade_id"]
+        symbol   = trade["symbol"]
+        outcome  = outcome_tracker.check_outcome(trade)
+
+        # Calculate how long trade has been open
+        trade_time = datetime.fromisoformat(trade["time"])
+        age_mins   = (datetime.utcnow() - trade_time).seconds // 60
+
+        if outcome:
+            # Auto-detected outcome — send confirmation buttons
+            emoji = "✅ WIN detected" if outcome == "win" else "❌ LOSS detected"
+            icon  = "🏆" if outcome == "win" else "💔"
+
+            keyboard = InlineKeyboardMarkup([[
+                InlineKeyboardButton(f"✅ Confirm WIN", callback_data=f"confirm_win_{trade_id}"),
+                InlineKeyboardButton(f"❌ Confirm LOSS", callback_data=f"confirm_loss_{trade_id}"),
+            ]])
+
+            try:
+                await telegram_bot.send_message(
+                    chat_id=CHAT_ID,
+                    text=(
+                        f"{icon} *AUTO-DETECTED OUTCOME*\n"
+                        f"━━━━━━━━━━━━━━━━━━━━━━\n"
+                        f"🔖 Trade ID: `{trade_id}`\n"
+                        f"💱 Pair: `{symbol}`\n"
+                        f"🤖 Bot detected: *{emoji}*\n"
+                        f"━━━━━━━━━━━━━━━━━━━━━━\n"
+                        f"_Please confirm below:_"
+                    ),
+                    reply_markup=keyboard,
+                    parse_mode="Markdown"
+                )
+                outcome_tracker.mark_confirmed(trade_id)
+                log.info(f"🤖 Auto-detected {outcome} for {trade_id} — awaiting user confirmation")
+            except Exception as e:
+                log.error(f"Auto-outcome send error: {e}")
+
+        elif age_mins >= 120:
+            # Trade open for 2+ hours — ask user manually
+            keyboard = InlineKeyboardMarkup([[
+                InlineKeyboardButton("✅ WIN", callback_data=f"confirm_win_{trade_id}"),
+                InlineKeyboardButton("❌ LOSS", callback_data=f"confirm_loss_{trade_id}"),
+                InlineKeyboardButton("⏳ Still Open", callback_data=f"still_open_{trade_id}"),
+            ]])
+            try:
+                await telegram_bot.send_message(
+                    chat_id=CHAT_ID,
+                    text=(
+                        f"⏰ *TRADE UPDATE NEEDED*\n"
+                        f"━━━━━━━━━━━━━━━━━━━━━━\n"
+                        f"🔖 Trade ID: `{trade_id}`\n"
+                        f"💱 Pair: `{symbol}`\n"
+                        f"⏱ Open for `{age_mins} minutes`\n"
+                        f"━━━━━━━━━━━━━━━━━━━━━━\n"
+                        f"_What was the result?_"
+                    ),
+                    reply_markup=keyboard,
+                    parse_mode="Markdown"
+                )
+                outcome_tracker.mark_confirmed(trade_id)
+                log.info(f"⏰ Manual outcome request sent for {trade_id}")
+            except Exception as e:
+                log.error(f"Manual outcome send error: {e}")
+
+
+async def callback_outcome(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Handles button taps from outcome confirmation messages."""
+    query    = update.callback_query
+    await query.answer()
+    data     = query.data
+    parts    = data.split("_")
+    action   = parts[1]   # win / loss / open
+    trade_id = "_".join(parts[2:])  # e.g. #TRD-043
+
+    if action == "open":
+        await query.edit_message_text(
+            f"⏳ Got it — `{trade_id}` marked as still open.\n"
+            f"I'll check again in 30 minutes.",
+            parse_mode="Markdown"
+        )
+        # Re-schedule check in 30 mins
+        for t in outcome_tracker.data["pending"]:
+            if t["trade_id"] == trade_id:
+                t["confirmed"] = False
+                t["check_after"] = (datetime.utcnow() + timedelta(minutes=30)).isoformat()
+        outcome_tracker._save()
+        return
+
+    win = (action == "win")
+
+    # Find matching pending signal in stats
+    pending = stats.data.get("pending", [])
+    entry   = None
+    for i, p in enumerate(pending):
+        if p.get("trade_id") == trade_id:
+            entry = pending.pop(i)
+            break
+
+    symbol  = entry["symbol"]  if entry else trade_id
+    session = entry.get("session","") if entry else ""
+
+    stats.record_result(symbol, win=win, session=session)
+    learning.record(symbol, session, win=win)
+    stats._save()
+
+    today  = stats.get_today_stats()
+    wr     = stats.get_win_rate()
+    streak = stats.data.get("streak", 0)
+
+    if win:
+        result_text = (
+            f"✅ *WIN CONFIRMED!*\n"
+            f"━━━━━━━━━━━━━━━━━━━━━━\n"
+            f"🔖 Trade ID: `{trade_id}`\n"
+            f"💱 Pair: `{symbol}`\n"
+            f"━━━━━━━━━━━━━━━━━━━━━━\n"
+            f"📊 Win Rate: `{wr}%`\n"
+            f"📅 Today: ✅ {today['wins']}W ❌ {today['losses']}L\n"
+            f"🔥 Streak: `{streak}`\n"
+            f"🧠 _Learning engine updated_"
+        )
+    else:
+        result_text = (
+            f"❌ *LOSS CONFIRMED*\n"
+            f"━━━━━━━━━━━━━━━━━━━━━━\n"
+            f"🔖 Trade ID: `{trade_id}`\n"
+            f"💱 Pair: `{symbol}`\n"
+            f"━━━━━━━━━━━━━━━━━━━━━━\n"
+            f"📊 Win Rate: `{wr}%`\n"
+            f"📅 Today: ✅ {today['wins']}W ❌ {today['losses']}L\n"
+            f"🧠 _Learning engine updated_"
+        )
+
+    await query.edit_message_text(result_text, parse_mode="Markdown")
+    log.info(f"✅ Outcome confirmed: {trade_id} → {'WIN' if win else 'LOSS'}")
 
 
 # ══════════════════════════════════════════════════════════════
@@ -1217,7 +1483,10 @@ def main():
             application.job_queue.run_repeating(
                 scan_and_send, interval=SCAN_EVERY * 60, first=30
             )
-            log.info("Job queue scanner started.")
+            application.job_queue.run_repeating(
+                auto_check_outcomes, interval=5 * 60, first=60
+            )
+            log.info("Job queue scanner + auto-outcome checker started.")
 
     app = (
         Application.builder()
@@ -1229,6 +1498,7 @@ def main():
         .build()
     )
 
+    app.add_handler(CallbackQueryHandler(callback_outcome))
     app.add_handler(CommandHandler("start",    cmd_start))
     app.add_handler(CommandHandler("help",     cmd_help))
     app.add_handler(CommandHandler("stats",    cmd_stats))
