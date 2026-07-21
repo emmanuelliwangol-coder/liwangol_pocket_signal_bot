@@ -231,10 +231,10 @@ class StatsTracker:
         trade_id = self.next_trade_id()
         entry = sig["price"]
         # Use strategy-specific SL/TP if provided (e.g. Range+PDHL strategy)
-    if "_sl" in sig:
-        sl, tp1, tp2, tp3 = sig["_sl"], sig["_tp1"], sig["_tp2"], sig["_tp3"]
-    else:
-        sl, tp1, tp2, tp3 = calculate_sl_tp(entry, sig["raw_dir"], sig["symbol"])
+        if "_sl" in sig:
+            sl, tp1, tp2, tp3 = sig["_sl"], sig["_tp1"], sig["_tp2"], sig["_tp3"]
+        else:
+            sl, tp1, tp2, tp3 = calculate_sl_tp(entry, sig["raw_dir"], sig["symbol"])
         self.data.setdefault("pending",[]).append({
             "trade_id":  trade_id,
             "symbol":    sig["symbol"],
