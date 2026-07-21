@@ -1133,56 +1133,77 @@ async def scan_and_send(context=None):
 async def auto_check_outcomes(context=None):
     """
     Runs every 5 minutes. Checks pending trades for TP/SL hits.
-    If detected: sends confirmation buttons to user.
-    If still open after 2 hours: sends manual confirmation request.
+    - If outcome detected: auto-records immediately + notifies user
+    - User has 5 minutes to override by tapping WIN/LOSS buttons
+    - If trade open 2+ hours with no detection: sends manual buttons
     """
     if telegram_bot is None: return
     due = outcome_tracker.get_due()
     if not due: return
 
     for trade in due:
-        trade_id = trade["trade_id"]
-        symbol   = trade["symbol"]
-        outcome  = outcome_tracker.check_outcome(trade)
-
-        # Calculate how long trade has been open
+        trade_id   = trade["trade_id"]
+        symbol     = trade["symbol"]
+        outcome    = outcome_tracker.check_outcome(trade)
         trade_time = datetime.fromisoformat(trade["time"])
         age_mins   = (datetime.utcnow() - trade_time).seconds // 60
 
         if outcome:
-            # Auto-detected outcome — send confirmation buttons
-            emoji = "✅ WIN detected" if outcome == "win" else "❌ LOSS detected"
-            icon  = "🏆" if outcome == "win" else "💔"
+            # ── AUTO-RECORD immediately ──────────────────────────
+            win = (outcome == "win")
 
+            # Find and pop from stats pending
+            pending = stats.data.get("pending", [])
+            entry   = None
+            for i, p in enumerate(pending):
+                if p.get("trade_id") == trade_id:
+                    entry = pending.pop(i)
+                    break
+
+            sess = entry.get("session","") if entry else ""
+            stats.record_result(symbol, win=win, session=sess)
+            learning.record(symbol, sess, win=win)
+            stats._save()
+            outcome_tracker.mark_confirmed(trade_id)
+
+            today  = stats.get_today_stats()
+            wr     = stats.get_win_rate()
+            streak = stats.data.get("streak", 0)
+            icon   = "🏆" if win else "💔"
+            label  = "WIN" if win else "LOSS"
+
+            # Send notification with override buttons (5 min window)
             keyboard = InlineKeyboardMarkup([[
-                InlineKeyboardButton(f"✅ Confirm WIN", callback_data=f"confirm_win_{trade_id}"),
-                InlineKeyboardButton(f"❌ Confirm LOSS", callback_data=f"confirm_loss_{trade_id}"),
+                InlineKeyboardButton("✅ Override WIN",  callback_data=f"confirm_win_{trade_id}"),
+                InlineKeyboardButton("❌ Override LOSS", callback_data=f"confirm_loss_{trade_id}"),
             ]])
-
             try:
                 await telegram_bot.send_message(
                     chat_id=CHAT_ID,
                     text=(
-                        f"{icon} *AUTO-DETECTED OUTCOME*\n"
+                        f"{icon} *AUTO-RECORDED: {label}*\n"
                         f"━━━━━━━━━━━━━━━━━━━━━━\n"
                         f"🔖 Trade ID: `{trade_id}`\n"
                         f"💱 Pair: `{symbol}`\n"
-                        f"🤖 Bot detected: *{emoji}*\n"
+                        f"🤖 Bot auto-recorded: *{'✅ WIN' if win else '❌ LOSS'}*\n"
                         f"━━━━━━━━━━━━━━━━━━━━━━\n"
-                        f"_Please confirm below:_"
+                        f"📊 Win Rate: `{wr}%`\n"
+                        f"📅 Today: ✅ {today['wins']}W ❌ {today['losses']}L\n"
+                        f"🔥 Streak: `{streak}`\n"
+                        f"━━━━━━━━━━━━━━━━━━━━━━\n"
+                        f"_Tap below within 5 mins to override if wrong_"
                     ),
                     reply_markup=keyboard,
                     parse_mode="Markdown"
                 )
-                outcome_tracker.mark_confirmed(trade_id)
-                log.info(f"🤖 Auto-detected {outcome} for {trade_id} — awaiting user confirmation")
+                log.info(f"🤖 Auto-recorded {outcome} for {trade_id}")
             except Exception as e:
                 log.error(f"Auto-outcome send error: {e}")
 
         elif age_mins >= 120:
-            # Trade open for 2+ hours — ask user manually
+            # Trade open 2+ hours — no detection, ask manually
             keyboard = InlineKeyboardMarkup([[
-                InlineKeyboardButton("✅ WIN", callback_data=f"confirm_win_{trade_id}"),
+                InlineKeyboardButton("✅ WIN",  callback_data=f"confirm_win_{trade_id}"),
                 InlineKeyboardButton("❌ LOSS", callback_data=f"confirm_loss_{trade_id}"),
                 InlineKeyboardButton("⏳ Still Open", callback_data=f"still_open_{trade_id}"),
             ]])
@@ -1219,14 +1240,14 @@ async def callback_outcome(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if action == "open":
         await query.edit_message_text(
             f"⏳ Got it — `{trade_id}` marked as still open.\n"
-            f"I'll check again in 30 minutes.",
+            f"I'll check again in 5 minutes.",
             parse_mode="Markdown"
         )
         # Re-schedule check in 30 mins
         for t in outcome_tracker.data["pending"]:
             if t["trade_id"] == trade_id:
                 t["confirmed"] = False
-                t["check_after"] = (datetime.utcnow() + timedelta(minutes=30)).isoformat()
+                t["check_after"] = (datetime.utcnow() + timedelta(minutes=5)).isoformat()
         outcome_tracker._save()
         return
 
