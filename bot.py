@@ -230,6 +230,10 @@ class StatsTracker:
     def add_pending(self, sig: dict):
         trade_id = self.next_trade_id()
         entry = sig["price"]
+        # Use strategy-specific SL/TP if provided (e.g. Range+PDHL strategy)
+    if "_sl" in sig:
+        sl, tp1, tp2, tp3 = sig["_sl"], sig["_tp1"], sig["_tp2"], sig["_tp3"]
+    else:
         sl, tp1, tp2, tp3 = calculate_sl_tp(entry, sig["raw_dir"], sig["symbol"])
         self.data.setdefault("pending",[]).append({
             "trade_id":  trade_id,
@@ -768,6 +772,139 @@ class TopDownAnalyzer:
 
 
 # ══════════════════════════════════════════════════════════════
+# STRATEGY 6: RANGE BREAKOUT + PREVIOUS DAY HIGH/LOW
+# ══════════════════════════════════════════════════════════════
+class RangePDHLAnalyzer:
+    """
+    Detects breakout of current session range toward Previous Day High/Low.
+    Logic:
+    - Calculate Previous Day High (PDH) and Previous Day Low (PDL)
+    - Calculate current session range (high/low of last 8-12 candles)
+    - Signal fires when price breaks out of range toward PDH or PDL
+    - TP = PDH or PDL, SL = back inside range
+    Best for: BTC, EURUSD, GBPUSD during London/NY session
+    """
+
+    def get_pdhl(self, df: pd.DataFrame):
+        """Get Previous Day High and Low from candle data."""
+        if len(df) < 50:
+            return None, None
+        # On 15min chart: 1 day = 96 candles
+        # Previous day = candles 96 to 192 bars back
+        prev_day = df.iloc[-192:-96] if len(df) >= 192 else df.iloc[:len(df)//2]
+        if len(prev_day) == 0:
+            return None, None
+        pdh = prev_day["High"].max()
+        pdl = prev_day["Low"].min()
+        return round(pdh, 5), round(pdl, 5)
+
+    def get_session_range(self, df: pd.DataFrame):
+        """Get current session range from last 12 candles (3 hours on 15min)."""
+        session = df.iloc[-12:]
+        rng_high = session["High"].max()
+        rng_low  = session["Low"].min()
+        return round(rng_high, 5), round(rng_low, 5)
+
+    def analyze(self, symbol, td_symbol, df, htf_bias, learning):
+        if len(df) < 50:
+            return None, None
+
+        pdh, pdl = self.get_pdhl(df)
+        if pdh is None or pdl is None:
+            return None, None
+
+        rng_high, rng_low = self.get_session_range(df)
+        price    = df["Close"].iloc[-1]
+        rsi_val  = ta.momentum.RSIIndicator(df["Close"], window=14).rsi().iloc[-1]
+
+        # Range must be meaningful (not too narrow)
+        rng_size = rng_high - rng_low
+        if rng_size < price * 0.0008:
+            return None, None
+
+        # Breakout above range high → targeting PDH
+        bull_break = (price > rng_high * 1.0002 and
+                      pdh > rng_high and
+                      price < pdh * 0.999 and   # not yet at PDH
+                      rsi_val > 50)
+
+        # Breakout below range low → targeting PDL
+        bear_break = (price < rng_low * 0.9998 and
+                      pdl < rng_low and
+                      price > pdl * 1.001 and   # not yet at PDL
+                      rsi_val < 50)
+
+        if not bull_break and not bear_break:
+            return None, None
+
+        bias  = "CALL" if bull_break else "PUT"
+        emoji = "✅ CALL" if bull_break else "🔴 PUT"
+
+        if bull_break:
+            tags = [
+                f"📊 Range Breakout ABOVE: `{rng_high}`",
+                f"🎯 Targeting PDH: `{pdh}`",
+                f"📏 Range: `{rng_low}` — `{rng_high}`",
+                f"📈 RSI Momentum: {rsi_val:.1f}",
+            ]
+        else:
+            tags = [
+                f"📊 Range Breakout BELOW: `{rng_low}`",
+                f"🎯 Targeting PDL: `{pdl}`",
+                f"📏 Range: `{rng_low}` — `{rng_high}`",
+                f"📉 RSI Momentum: {rsi_val:.1f}",
+            ]
+
+        # Base confidence 65% — strong setup when all conditions met
+        confidence = 65
+        if htf_bias == bias:
+            confidence = min(confidence + 10, 100)
+        # Bonus if price just broke out (strong momentum)
+        if rsi_val > 60 and bull_break or rsi_val < 40 and bear_break:
+            confidence = min(confidence + 8, 100)
+
+        weight     = learning.get_weight(symbol)
+        confidence = min(int(confidence * weight), 100)
+        threshold  = learning.get_threshold(symbol)
+
+        # Custom SL/TP for this strategy
+        # SL = back inside range, TP = PDH or PDL
+        if bull_break:
+            sl  = round(rng_high * 0.9985, 5)   # just below breakout level
+            tp1 = round(price + (pdh - price) * 0.5, 5)   # 50% to PDH
+            tp2 = round(price + (pdh - price) * 0.75, 5)  # 75% to PDH
+            tp3 = round(pdh, 5)                            # full PDH target
+        else:
+            sl  = round(rng_low * 1.0015, 5)    # just above breakout level
+            tp1 = round(price - (price - pdl) * 0.5, 5)   # 50% to PDL
+            tp2 = round(price - (price - pdl) * 0.75, 5)  # 75% to PDL
+            tp3 = round(pdl, 5)                            # full PDL target
+
+        sig = {
+            "symbol":    symbol,
+            "direction": emoji,
+            "raw_dir":   bias,
+            "price":     round(price, 5),
+            "rsi":       rsi_val,
+            "score":     len(tags),
+            "confidence":   confidence,
+            "threshold":    threshold,
+            "smc_tags":     tags,
+            "pending_tags": [],
+            "session":   session_name(symbol),
+            "htf_bias":  htf_bias or "Neutral",
+            "weight":    weight,
+            "strategy":  "Range + PDH/PDL",
+            # Override SL/TP with strategy-specific levels
+            "_sl": sl, "_tp1": tp1, "_tp2": tp2, "_tp3": tp3,
+        }
+
+        if confidence >= threshold:      return sig, "signal"
+        if confidence >= PRE_SIGNAL_MIN: return sig, "presignal"
+        return None, None
+
+
+# ══════════════════════════════════════════════════════════════
 # MARKET CONDITION DETECTOR
 # ══════════════════════════════════════════════════════════════
 def detect_market_condition(df):
@@ -798,6 +935,7 @@ class AdaptiveStrategySelector:
         self.breakout = LondonBreakoutAnalyzer()
         self.pa       = PriceActionAnalyzer()
         self.topdown  = TopDownAnalyzer()
+        self.pdhl     = RangePDHLAnalyzer()
 
     def select(self, symbol, td_symbol, learning):
         if not is_active_session(symbol): return None, None
@@ -825,6 +963,9 @@ class AdaptiveStrategySelector:
             if r[0]: candidates.append(r)
         r = self.pa.analyze(symbol, td_symbol, df, htf, learning)
         if r[0]: candidates.append(r)
+        # Range + PDH/PDL — runs in all conditions
+        r = self.pdhl.analyze(symbol, td_symbol, df, htf, learning)
+        if r[0]: candidates.append(r)
         r = self.smc.analyze(symbol, td_symbol, learning)
         if r[0]: candidates.append(r)
         if not candidates: return None, None
@@ -846,7 +987,11 @@ def format_signal(sig: dict, trade_id: str = "") -> str:
     stars = "⭐" * sig["score"]
     entry = sig["price"]
     conf  = sig["confidence"]
-    sl, tp1, tp2, tp3 = calculate_sl_tp(entry, sig["raw_dir"], sig["symbol"])
+    # Use strategy-specific SL/TP if provided (e.g. Range+PDHL strategy)
+    if "_sl" in sig:
+        sl, tp1, tp2, tp3 = sig["_sl"], sig["_tp1"], sig["_tp2"], sig["_tp3"]
+    else:
+        sl, tp1, tp2, tp3 = calculate_sl_tp(entry, sig["raw_dir"], sig["symbol"])
 
     if conf >= 85:   conf_label = "🔥 ELITE"
     elif conf >= 70: conf_label = "💎 HIGH"
@@ -1320,7 +1465,8 @@ async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         f"• 📈 Trend Pullback (EMA20/50 zones)\n"
         f"• 🇬🇧 London Breakout (08:00-09:00 UTC)\n"
         f"• 📐 Price Action + Market Structure\n"
-        f"• 🔭 Top Down Analysis (1H → 15M)\n\n"
+        f"• 🔭 Top Down Analysis (1H → 15M)\n"
+        f"• 📏 Range + PDH/PDL Breakout\n\n"
         f"🧠 *Self-Learning Engine*\n"
         f"• Re-evaluates every 10 trades\n"
         f"• Auto-adjusts thresholds per pair\n"
