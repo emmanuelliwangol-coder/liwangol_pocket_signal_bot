@@ -1527,6 +1527,7 @@ async def cmd_help(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "/pause — Pause signals\n"
         "/resume — Resume signals\n"
         "/unsuppress XAUUSD — Reset a suppressed pair to a clean slate\n"
+        "/resetall confirm — Full reset: clear all trades & learning data\n"
         "/help — This message",
         parse_mode="Markdown"
     )
@@ -1608,6 +1609,57 @@ async def cmd_unsuppress(update: Update, context: ContextTypes.DEFAULT_TYPE):
         f"✅ Weight reset to `1.0x`\n"
         f"━━━━━━━━━━━━━━━━━━━━━━\n"
         f"🧠 _{symbol} will be scanned normally again and re-evaluated fresh from its next 5+ trades._",
+        parse_mode="Markdown"
+    )
+
+async def cmd_resetall(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """
+    Full fresh-start reset: clears all open trades (their SL/TP with them),
+    all win/loss history, and resets the learning engine to a blank slate
+    for every pair (no suppression, no weighting, base threshold everywhere).
+    Requires /resetall confirm to actually run — destructive and irreversible.
+    """
+    if not context.args or context.args[0].lower() != "confirm":
+        pending_count = len(stats.data.get("pending", []))
+        trades_count  = len(stats.data.get("trades", []))
+        await update.message.reply_text(
+            f"⚠️ *FULL RESET — this cannot be undone*\n"
+            f"━━━━━━━━━━━━━━━━━━━━━━\n"
+            f"This will clear:\n"
+            f"• `{pending_count}` open trade(s) and their SL/TP\n"
+            f"• `{trades_count}` completed trade(s) from win/loss history\n"
+            f"• Learning engine for *all* pairs (weights, thresholds, suppression)\n"
+            f"━━━━━━━━━━━━━━━━━━━━━━\n"
+            f"Every pair restarts at `{BASE_CONFIDENCE}%` threshold, `1.0x` weight, `0W/0L`.\n\n"
+            f"Reply `/resetall confirm` to proceed.",
+            parse_mode="Markdown"
+        )
+        return
+
+    # Clear all pending/open trades (carries their SL/TP)
+    stats.data["pending"] = []
+    stats.data["trades"] = []
+    stats.data["streak"] = 0
+    stats.data["best_streak"] = 0
+    stats._save()
+
+    # Clear all pending outcome checks
+    outcome_tracker.data["pending"] = []
+    outcome_tracker._save()
+
+    # Reset learning engine to a blank slate for every pair
+    learning.data = learning._default()
+    learning._save()
+
+    await update.message.reply_text(
+        f"🧹 *FULL RESET COMPLETE*\n"
+        f"━━━━━━━━━━━━━━━━━━━━━━\n"
+        f"✅ All open trades and SL/TP cleared\n"
+        f"✅ Win/loss history wiped\n"
+        f"✅ Every pair reset to `{BASE_CONFIDENCE}%` threshold, `1.0x` weight, `0W/0L`\n"
+        f"✅ No pairs suppressed\n"
+        f"━━━━━━━━━━━━━━━━━━━━━━\n"
+        f"🧠 _The bot now learns entirely from fresh trades going forward._",
         parse_mode="Markdown"
     )
 
@@ -1740,6 +1792,7 @@ def main():
     app.add_handler(CommandHandler("pause",    cmd_pause))
     app.add_handler(CommandHandler("resume",   cmd_resume))
     app.add_handler(CommandHandler("unsuppress", cmd_unsuppress))
+    app.add_handler(CommandHandler("resetall", cmd_resetall))
     app.add_error_handler(error_handler)
 
     webhook_path    = f"/webhook/{BOT_TOKEN}"
