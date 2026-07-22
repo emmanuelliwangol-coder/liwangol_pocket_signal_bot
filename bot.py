@@ -288,6 +288,10 @@ class StatsTracker:
             else:        result[s]["losses"] += 1
         return result
 
+    def has_open_trade(self, symbol: str) -> bool:
+        """True if this pair already has an unresolved (pending) trade."""
+        return any(p.get("symbol") == symbol for p in self.data.get("pending", []))
+
     def full_report(self) -> str:
         trades  = self.data.get("trades",[])
         total   = len(trades)
@@ -1238,6 +1242,13 @@ async def scan_and_send(context=None):
 
     for symbol, td_symbol in PAIRS.items():
         await asyncio.sleep(15)
+
+        # Skip pairs that already have an unresolved trade — prevents duplicate
+        # signals and repetitive "setup forming" alerts firing on top of an open trade.
+        if stats.has_open_trade(symbol):
+            log.info(f"⏭ {symbol} skipped — trade already open, waiting for resolution")
+            continue
+
         sig, sig_type = analyzer.select(symbol, td_symbol, learning)
 
         if sig and sig_type == "signal":
@@ -1265,8 +1276,8 @@ async def scan_and_send(context=None):
         elif sig and sig_type == "presignal":
             last = presignal_sent.get(symbol)
             now  = datetime.utcnow()
-            # Only send pre-signal once per 30 minutes per pair
-            if not last or (now - last).seconds > 1800:
+            # Only send pre-signal once per 60 minutes per pair
+            if not last or (now - last).seconds > 3600:
                 try:
                     await telegram_bot.send_message(
                         chat_id=CHAT_ID,
