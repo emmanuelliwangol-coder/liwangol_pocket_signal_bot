@@ -183,6 +183,20 @@ class LearningEngine:
     def get_weight(self, symbol: str) -> float:
         return self.data["pair_weights"].get(symbol, 1.0)
 
+    def reset_pair(self, symbol: str):
+        """
+        Give a pair a clean slate: clears its win/loss history, resets threshold
+        and weight to base, and removes it from suppression. Used by /unsuppress
+        so a previously suppressed pair isn't immediately re-suppressed by stale
+        historical stats on the next 10-trade re-evaluation.
+        """
+        self.data["pair_stats"][symbol] = {"wins": 0, "losses": 0}
+        self.data["pair_threshold"][symbol] = BASE_CONFIDENCE
+        self.data["pair_weights"][symbol] = 1.0
+        if symbol in self.data.get("suppressed_pairs", []):
+            self.data["suppressed_pairs"].remove(symbol)
+        self._save()
+
     def summary(self) -> str:
         lines = ["🧠 *Self-Learning Status*\n━━━━━━━━━━━━━━━━━━━━━━"]
         for pair, stats in self.data["pair_stats"].items():
@@ -1512,6 +1526,7 @@ async def cmd_help(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "/loss EURUSD — Record LOSS for specific pair\n\n"
         "/pause — Pause signals\n"
         "/resume — Resume signals\n"
+        "/unsuppress XAUUSD — Reset a suppressed pair to a clean slate\n"
         "/help — This message",
         parse_mode="Markdown"
     )
@@ -1568,6 +1583,33 @@ async def cmd_resume(update: Update, context: ContextTypes.DEFAULT_TYPE):
     global bot_paused
     bot_paused = False
     await update.message.reply_text("▶️ Bot resumed!")
+
+async def cmd_unsuppress(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not context.args:
+        await update.message.reply_text(
+            "⚠️ Usage: `/unsuppress XAUUSD`\n"
+            f"Valid pairs: {', '.join(PAIRS.keys())}",
+            parse_mode="Markdown"
+        )
+        return
+    symbol = context.args[0].upper()
+    if symbol not in PAIRS:
+        await update.message.reply_text(
+            f"⚠️ Unknown pair `{symbol}`.\nValid pairs: {', '.join(PAIRS.keys())}",
+            parse_mode="Markdown"
+        )
+        return
+    learning.reset_pair(symbol)
+    await update.message.reply_text(
+        f"🔓 *{symbol} UNSUPPRESSED*\n"
+        f"━━━━━━━━━━━━━━━━━━━━━━\n"
+        f"✅ Win/loss history cleared\n"
+        f"✅ Threshold reset to `{BASE_CONFIDENCE}%`\n"
+        f"✅ Weight reset to `1.0x`\n"
+        f"━━━━━━━━━━━━━━━━━━━━━━\n"
+        f"🧠 _{symbol} will be scanned normally again and re-evaluated fresh from its next 5+ trades._",
+        parse_mode="Markdown"
+    )
 
 def _pop_pending(args: list) -> dict | None:
     pending = stats.data.get("pending", [])
@@ -1697,6 +1739,7 @@ def main():
     app.add_handler(CommandHandler("loss",     cmd_loss))
     app.add_handler(CommandHandler("pause",    cmd_pause))
     app.add_handler(CommandHandler("resume",   cmd_resume))
+    app.add_handler(CommandHandler("unsuppress", cmd_unsuppress))
     app.add_error_handler(error_handler)
 
     webhook_path    = f"/webhook/{BOT_TOKEN}"
