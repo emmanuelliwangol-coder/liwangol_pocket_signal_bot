@@ -21,7 +21,7 @@ TD_API_KEY  = os.getenv("TD_API_KEY","")
 WEBHOOK_URL = os.getenv("WEBHOOK_URL","")
 WEBHOOK_PORT= int(os.getenv("PORT","8080"))
 
-SCAN_EVERY      = 5       # minutes between scans
+SCAN_EVERY      = 15      # minutes between scans (raised from 5 to cut Twelve Data API usage)
 MIN_SCORE       = 2       # minimum SMC confluence factors
 BASE_CONFIDENCE = 55      # base confidence threshold (%)
 PRE_SIGNAL_MIN  = 40      # pre-signal alert threshold (%)
@@ -528,7 +528,13 @@ class SMCAnalyzer:
         if close.iloc[-1] < ema20 < ema50: return "PUT"
         return None
 
-    def analyze(self, symbol: str, td_symbol: str, learning: "LearningEngine"):
+    def analyze(self, symbol: str, td_symbol: str, learning: "LearningEngine", df=None, htf=None):
+        """
+        df/htf can be passed in by the caller (AdaptiveStrategySelector) to reuse
+        candles/HTF bias already fetched this scan cycle, instead of re-fetching
+        from Twelve Data / Binance a second time. Falls back to fetching if not provided
+        (e.g. when called standalone).
+        """
         if not is_active_session(symbol):
             return None, None
 
@@ -537,11 +543,12 @@ class SMCAnalyzer:
             log.info(f"🔴 {symbol} suppressed by learning engine — skip")
             return None, None
 
-        # Fetch data
-        if symbol == "BTCUSD":
-            df = fetch_binance_candles("BTCUSDT", interval="15m", limit=100)
-        else:
-            df = fetch_candles(td_symbol, interval="15min", outputsize=100)
+        # Fetch data only if not already supplied by the caller
+        if df is None:
+            if symbol == "BTCUSD":
+                df = fetch_binance_candles("BTCUSDT", interval="15m", limit=100)
+            else:
+                df = fetch_candles(td_symbol, interval="15min", outputsize=100)
 
         if df is None or len(df) < 30:
             return None, None
@@ -585,8 +592,9 @@ class SMCAnalyzer:
         # ── CONFIDENCE CALCULATION ──────────────────────
         confidence = round((score / MAX_SCORE) * 100)
 
-        # Bonus: HTF alignment
-        htf = self.get_htf_bias(td_symbol, symbol)
+        # Bonus: HTF alignment — reuse HTF bias if the caller already fetched it this cycle
+        if htf is None:
+            htf = self.get_htf_bias(td_symbol, symbol)
         if htf == bias:
             confidence = min(confidence + 8, 100)
 
@@ -966,7 +974,8 @@ class AdaptiveStrategySelector:
         # Range + PDH/PDL — runs in all conditions
         r = self.pdhl.analyze(symbol, td_symbol, df, htf, learning)
         if r[0]: candidates.append(r)
-        r = self.smc.analyze(symbol, td_symbol, learning)
+        # SMC PRO — reuse the df/htf already fetched above instead of re-fetching
+        r = self.smc.analyze(symbol, td_symbol, learning, df=df, htf=htf)
         if r[0]: candidates.append(r)
         if not candidates: return None, None
         best_sig, best_type = max(candidates, key=lambda x: x[0]["confidence"])
